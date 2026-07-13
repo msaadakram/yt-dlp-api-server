@@ -41,6 +41,12 @@ def _get_cookies_file():
     return None
 
 
+# Smart format fallback chain:
+# 'best' is deprecated in yt-dlp. Use bestvideo+bestaudio merged, or best single file,
+# or fall back to whatever is available.
+DEFAULT_FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best/bestvideo/bestaudio'
+
+
 class SimpleYDL(yt_dlp.YoutubeDL):
     def __init__(self, *args, **kargs):
         super(SimpleYDL, self).__init__(*args, **kargs)
@@ -52,7 +58,7 @@ def get_videos(url, extra_params):
     Get a list with a dict for every video founded
     '''
     ydl_params = {
-        'format': 'best',
+        'format': DEFAULT_FORMAT,
         'cachedir': False,
         'logger': current_app.logger.getChild('youtube-dl'),
     }
