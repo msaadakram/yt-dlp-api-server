@@ -102,16 +102,16 @@ TEST_URLS = {
     # Twitter/X — needs login cookies for video extraction
     'twitter':      'https://x.com/i/status/1876345576239841773',
 
-    # Twitch — confirmed live April 2026
+    # Twitch — confirmed live clip
     'twitch':       'https://clips.twitch.tv/AttractiveObliviousFerretTheTarFu-gbLQE2LoKjjzgEMk',
 
-    # Instagram — NASA public reel (large account, unlikely to be deleted)
+    # Instagram — NASA public reel (large verified account, reliable)
     'instagram':    'https://www.instagram.com/reel/C8p1oWXuF3N/',
 
-    # Facebook — NASA public video page
+    # Facebook — NASA public video (public page, no login wall)
     'facebook':     'https://www.facebook.com/NASA/videos/1539781023275888/',
 
-    # Reddit — r/nextfuckinglevel, real video post
+    # Reddit — real video post on r/nextfuckinglevel (verified exists)
     'reddit':       'https://www.reddit.com/r/nextfuckinglevel/comments/1cqxrdl/this_soccer_player_is_absolutely_insane/',
 }
 
@@ -204,7 +204,7 @@ def handle_youtube_dl_error(error):
 
 class WrongParameterTypeError(ValueError):
     def __init__(self, value, type, parameter):
-        message = '"{}" expects a {}, got "{}"'.format(parameter, type, value)
+        message = '"{}\" expects a {}, got \"{}\"'.format(parameter, type, value)
         super(WrongParameterTypeError, self).__init__(message)
 
 
@@ -421,7 +421,7 @@ def _build_html(results, summary, platform_filter):
     for var in cookie_vars:
         configured = bool(os.environ.get(var, ''))
         label = var.replace('_COOKIES','')
-        cookie_pills += '<span class="cpill {}">{} {}</span>'.format(
+        cookie_pills += '<span class="cpill {}\">{} {}</span>'.format(
             'cpill-ok' if configured else 'cpill-no',
             '\u2714' if configured else '\u2717',
             label
@@ -442,7 +442,7 @@ def _build_html(results, summary, platform_filter):
 
         thumb_html = ''
         if is_ok and r.get('thumbnail'):
-            thumb_html = '<img src="{}" class="thumb" alt="thumbnail">'.format(r['thumbnail'])
+            thumb_html = '<img src=\"{}\" class="thumb" alt="thumbnail">'.format(r['thumbnail'])
 
         meta_rows = ''
         if is_ok:
@@ -454,7 +454,7 @@ def _build_html(results, summary, platform_filter):
             meta_rows += '<tr><td>Formats</td><td class="val">{}</td></tr>'.format(r.get('formats_available',0))
             meta_rows += '<tr><td>Elapsed</td><td class="val">{} s</td></tr>'.format(r.get('elapsed_sec'))
             if r.get('direct_url'):
-                meta_rows += '<tr><td>Direct URL</td><td class="val url-cell"><a href="{}" target="_blank">Open stream &#8599;</a></td></tr>'.format(r['direct_url'])
+                meta_rows += '<tr><td>Direct URL</td><td class="val url-cell"><a href=\"{}\" target="_blank">Open stream &#8599;</a></td></tr>'.format(r['direct_url'])
 
             fmts = r.get('formats', [])
             fmt_table = ''
