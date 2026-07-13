@@ -17,24 +17,70 @@ if not hasattr(sys.stderr, 'isatty'):
     sys.stderr.isatty = lambda: False
 
 
-_COOKIES_ENV = os.environ.get('YOUTUBE_COOKIES', '')
+# ---------------------------------------------------------------
+# Per-platform cookie resolution
+# Each platform reads its own env var, falls back to YOUTUBE_COOKIES,
+# then falls back to the repo cookies.txt file.
+# ---------------------------------------------------------------
 _COOKIES_REPO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
-_COOKIES_TEMP_PATH = None
 
-def _get_cookies_file():
-    global _COOKIES_TEMP_PATH
-    if _COOKIES_ENV:
-        if _COOKIES_TEMP_PATH is None or not os.path.isfile(_COOKIES_TEMP_PATH):
-            tmp = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.txt', prefix='yt_cookies_', delete=False
-            )
-            tmp.write(_COOKIES_ENV)
-            tmp.flush()
-            tmp.close()
-            _COOKIES_TEMP_PATH = tmp.name
-        return _COOKIES_TEMP_PATH
+# Map: domain keyword -> env var name
+PLATFORM_COOKIE_ENV = {
+    'instagram':   'INSTAGRAM_COOKIES',
+    'facebook':    'FACEBOOK_COOKIES',
+    'reddit':      'REDDIT_COOKIES',
+    'twitter':     'TWITTER_COOKIES',
+    'x.com':       'TWITTER_COOKIES',
+    'tiktok':      'TIKTOK_COOKIES',
+    'youtube':     'YOUTUBE_COOKIES',
+    'youtu.be':    'YOUTUBE_COOKIES',
+}
+
+# Cache written temp files so we don't recreate on every request
+_COOKIE_TEMP_CACHE = {}
+
+
+def _write_temp_cookies(env_var_name):
+    """Write env var cookie content to a temp file, cache and return path."""
+    if env_var_name in _COOKIE_TEMP_CACHE:
+        path = _COOKIE_TEMP_CACHE[env_var_name]
+        if os.path.isfile(path):
+            return path
+    content = os.environ.get(env_var_name, '')
+    if not content:
+        return None
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', prefix='cookies_{}_'.format(env_var_name), delete=False
+    )
+    tmp.write(content)
+    tmp.flush()
+    tmp.close()
+    _COOKIE_TEMP_CACHE[env_var_name] = tmp.name
+    return tmp.name
+
+
+def _get_cookies_for_url(url):
+    """
+    Return best cookies file path for a given URL.
+    Priority: platform-specific env var > YOUTUBE_COOKIES (generic) > repo cookies.txt
+    """
+    url_lower = url.lower()
+    for keyword, env_var in PLATFORM_COOKIE_ENV.items():
+        if keyword in url_lower:
+            path = _write_temp_cookies(env_var)
+            if path:
+                return path
+            break  # matched platform but no cookie set, try generic
+
+    # Generic fallback: YOUTUBE_COOKIES used as a catch-all
+    generic = _write_temp_cookies('YOUTUBE_COOKIES')
+    if generic:
+        return generic
+
+    # Repo-level cookies.txt fallback
     if os.path.isfile(_COOKIES_REPO_FILE):
         return _COOKIES_REPO_FILE
+
     return None
 
 
@@ -98,7 +144,7 @@ def get_videos(url, extra_params):
             }
         },
     }
-    cookies_path = _get_cookies_file()
+    cookies_path = _get_cookies_for_url(url)
     if cookies_path:
         ydl_params['cookiefile'] = cookies_path
     ydl_params.update(extra_params)
@@ -250,6 +296,24 @@ def version():
     return jsonify(result)
 
 
+@route_api('cookies/status')
+@set_access_control
+def cookies_status():
+    """Check which platform cookies are configured."""
+    all_vars = [
+        'YOUTUBE_COOKIES', 'INSTAGRAM_COOKIES', 'FACEBOOK_COOKIES',
+        'REDDIT_COOKIES', 'TWITTER_COOKIES', 'TIKTOK_COOKIES',
+    ]
+    status = {}
+    for var in all_vars:
+        val = os.environ.get(var, '')
+        status[var] = {
+            'configured': bool(val),
+            'length': len(val) if val else 0,
+        }
+    return jsonify({'cookies': status})
+
+
 def _run_test(platform, url):
     t0 = time.time()
     try:
@@ -268,7 +332,7 @@ def _run_test(platform, url):
                 }
             },
         }
-        cookies_path = _get_cookies_file()
+        cookies_path = _get_cookies_for_url(url)
         if cookies_path:
             ydl_params['cookiefile'] = cookies_path
 
@@ -278,7 +342,6 @@ def _run_test(platform, url):
         formats = info.get('formats', [])
         direct_url = (formats[-1].get('url') if formats else None) or info.get('url')
 
-        # Build formats list: ext, resolution, filesize
         fmt_list = []
         for f in formats:
             fmt_list.append({
@@ -293,19 +356,21 @@ def _run_test(platform, url):
             })
 
         elapsed = round(time.time() - t0, 2)
+        cookies_path_used = _get_cookies_for_url(url)
         return {
-            'status':           'ok',
-            'url':              url,
-            'title':            info.get('title', 'N/A'),
-            'uploader':         info.get('uploader', 'N/A'),
-            'duration':         info.get('duration', 'N/A'),
-            'view_count':       info.get('view_count'),
-            'thumbnail':        info.get('thumbnail'),
+            'status':            'ok',
+            'url':               url,
+            'title':             info.get('title', 'N/A'),
+            'uploader':          info.get('uploader', 'N/A'),
+            'duration':          info.get('duration', 'N/A'),
+            'view_count':        info.get('view_count'),
+            'thumbnail':         info.get('thumbnail'),
             'formats_available': len(formats),
-            'formats':          fmt_list,
-            'direct_url':       direct_url,
-            'login_required':   platform in LOGIN_REQUIRED,
-            'elapsed_sec':      elapsed,
+            'formats':           fmt_list,
+            'direct_url':        direct_url,
+            'cookies_used':      bool(cookies_path_used),
+            'login_required':    platform in LOGIN_REQUIRED,
+            'elapsed_sec':       elapsed,
         }
     except Exception as e:
         elapsed = round(time.time() - t0, 2)
@@ -313,6 +378,7 @@ def _run_test(platform, url):
             'status':         'error',
             'url':            url,
             'error':          str(e),
+            'cookies_used':   bool(_get_cookies_for_url(url)),
             'login_required': platform in LOGIN_REQUIRED,
             'elapsed_sec':    elapsed,
         }
@@ -343,16 +409,31 @@ def _build_html(results, summary, platform_filter):
     total  = summary['total']
     score_color = '#22c55e' if passed == total else ('#f59e0b' if passed >= total // 2 else '#ef4444')
 
+    # Cookie status bar
+    cookie_vars = ['YOUTUBE_COOKIES','INSTAGRAM_COOKIES','FACEBOOK_COOKIES','REDDIT_COOKIES','TWITTER_COOKIES','TIKTOK_COOKIES']
+    cookie_pills = ''
+    for var in cookie_vars:
+        configured = bool(os.environ.get(var, ''))
+        label = var.replace('_COOKIES','')
+        cookie_pills += '<span class="cpill {}">{} {}</span>'.format(
+            'cpill-ok' if configured else 'cpill-no',
+            '\u2714' if configured else '\u2717',
+            label
+        )
+
     cards = ''
     for platform, r in sorted(results.items()):
         icon     = PLATFORM_ICONS.get(platform, '\U0001f310')
         is_ok    = r['status'] == 'ok'
         is_login = r.get('login_required', False)
+        cookies_used = r.get('cookies_used', False)
         status_badge = (
-            '<span class="badge ok">\u2705 OK</span>' if is_ok else
-            '<span class="badge login">\U0001f512 Login Required</span>' if is_login else
-            '<span class="badge err">\u274c ERROR</span>'
+            '<span class="badge ok">&#10003; OK</span>' if is_ok else
+            '<span class="badge login">&#128274; Login Required</span>' if (is_login and not cookies_used) else
+            '<span class="badge err">&#10007; ERROR</span>'
         )
+        cookie_badge = '<span class="badge cookie">&#127850; cookies</span>' if cookies_used else ''
+
         thumb_html = ''
         if is_ok and r.get('thumbnail'):
             thumb_html = '<img src="{}" class="thumb" alt="thumbnail">'.format(r['thumbnail'])
@@ -369,17 +450,10 @@ def _build_html(results, summary, platform_filter):
             if r.get('direct_url'):
                 meta_rows += '<tr><td>Direct URL</td><td class="val url-cell"><a href="{}" target="_blank">Open stream &#8599;</a></td></tr>'.format(r['direct_url'])
 
-            # formats table
             fmts = r.get('formats', [])
             fmt_table = ''
             if fmts:
-                fmt_table = '''
-            <details>
-              <summary>Show all {} formats</summary>
-              <table class="fmt-table">
-                <thead><tr><th>ID</th><th>Ext</th><th>Resolution</th><th>VCodec</th><th>ACodec</th><th>Bitrate</th><th>Size</th></tr></thead>
-                <tbody>
-            '''.format(len(fmts))
+                fmt_table = '<details><summary>Show all {} formats</summary><table class="fmt-table"><thead><tr><th>ID</th><th>Ext</th><th>Resolution</th><th>VCodec</th><th>ACodec</th><th>Bitrate</th><th>Size</th></tr></thead><tbody>'.format(len(fmts))
                 for f in fmts:
                     fmt_table += '<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
                         f.get('id',''), f.get('ext',''), f.get('resolution',''),
@@ -391,7 +465,7 @@ def _build_html(results, summary, platform_filter):
         else:
             err_msg = r.get('error', 'Unknown error')
             meta_rows += '<tr><td>Error</td><td class="val err-msg">{}</td></tr>'.format(err_msg)
-            meta_rows += '<tr><td>Elapsed</td><td class="val">{} s</td></tr>'.format(r.get('elapsed_sec', 'N/A'))
+            meta_rows += '<tr><td>Elapsed</td><td class="val">{} s</td></tr>'.format(r.get('elapsed_sec','N/A'))
             fmt_table = ''
 
         cards += '''
@@ -399,7 +473,7 @@ def _build_html(results, summary, platform_filter):
       <div class="card-header">
         <span class="platform-icon">{icon}</span>
         <span class="platform-name">{name}</span>
-        {badge}
+        {badge}{cookie_badge}
       </div>
       {thumb}
       <table class="meta-table"><tbody>{meta}</tbody></table>
@@ -407,14 +481,11 @@ def _build_html(results, summary, platform_filter):
       <div class="source-url"><a href="{url}" target="_blank">{url}</a></div>
     </div>
     '''.format(
-            cls='card-ok' if is_ok else ('card-login' if is_login else 'card-err'),
-            icon=icon,
-            name=platform.upper(),
-            badge=status_badge,
-            thumb=thumb_html,
-            meta=meta_rows,
-            fmt_table=fmt_table,
-            url=r['url'],
+            cls='card-ok' if is_ok else ('card-login' if (is_login and not cookies_used) else 'card-err'),
+            icon=icon, name=platform.upper(),
+            badge=status_badge, cookie_badge=cookie_badge,
+            thumb=thumb_html, meta=meta_rows,
+            fmt_table=fmt_table, url=r['url'],
         )
 
     platform_buttons = ''.join(
@@ -433,31 +504,36 @@ def _build_html(results, summary, platform_filter):
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:24px}}
   h1{{font-size:1.8rem;font-weight:700;color:#f8fafc;margin-bottom:4px}}
-  .subtitle{{color:#94a3b8;font-size:.9rem;margin-bottom:20px}}
-  .score-bar{{display:flex;align-items:center;gap:16px;background:#1e293b;border-radius:12px;padding:16px 24px;margin-bottom:24px}}
+  .subtitle{{color:#94a3b8;font-size:.9rem;margin-bottom:16px}}
+  .score-bar{{display:flex;align-items:center;gap:16px;background:#1e293b;border-radius:12px;padding:16px 24px;margin-bottom:16px;flex-wrap:wrap}}
   .score-num{{font-size:2.4rem;font-weight:800;color:{score_color}}}
   .score-label{{color:#94a3b8;font-size:.9rem}}
   .score-detail{{margin-left:auto;font-size:.85rem;color:#64748b}}
-  .btn-plat{{display:inline-block;padding:6px 14px;margin:4px;border-radius:8px;background:#1e293b;color:#94a3b8;text-decoration:none;font-size:.82rem;border:1px solid #334155;transition:.15s}}
+  .cookie-bar{{display:flex;flex-wrap:wrap;gap:8px;background:#1e293b;border-radius:10px;padding:12px 20px;margin-bottom:20px;align-items:center}}
+  .cookie-bar-label{{font-size:.8rem;color:#64748b;margin-right:4px}}
+  .cpill{{font-size:.75rem;padding:3px 10px;border-radius:20px;font-weight:600}}
+  .cpill-ok{{background:#14532d;color:#86efac}}
+  .cpill-no{{background:#1e293b;color:#475569;border:1px solid #334155}}
+  .btn-plat{{display:inline-block;padding:6px 14px;margin:4px;border-radius:8px;background:#1e293b;color:#94a3b8;text-decoration:none;font-size:.82rem;border:1px solid #334155}}
   .btn-plat:hover{{background:#334155;color:#f1f5f9}}
   .btn-all{{background:#3b82f6;color:#fff;border-color:#3b82f6}}
-  .btn-all:hover{{background:#2563eb}}
   .filter-bar{{margin-bottom:24px}}
   .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:20px}}
   .card{{background:#1e293b;border-radius:14px;overflow:hidden;border:1px solid #334155}}
   .card-ok{{border-color:#166534}}
   .card-err{{border-color:#7f1d1d}}
   .card-login{{border-color:#78350f}}
-  .card-header{{display:flex;align-items:center;gap:10px;padding:14px 16px;background:#0f172a;border-bottom:1px solid #334155}}
+  .card-header{{display:flex;align-items:center;gap:8px;padding:14px 16px;background:#0f172a;border-bottom:1px solid #334155;flex-wrap:wrap}}
   .platform-icon{{font-size:1.4rem}}
   .platform-name{{font-weight:700;font-size:1rem;letter-spacing:.05em;flex:1}}
-  .badge{{font-size:.75rem;padding:3px 10px;border-radius:20px;font-weight:600}}
+  .badge{{font-size:.72rem;padding:3px 9px;border-radius:20px;font-weight:600}}
   .badge.ok{{background:#14532d;color:#86efac}}
   .badge.err{{background:#7f1d1d;color:#fca5a5}}
   .badge.login{{background:#78350f;color:#fcd34d}}
+  .badge.cookie{{background:#1e3a5f;color:#93c5fd}}
   .thumb{{width:100%;height:180px;object-fit:cover;display:block}}
   .meta-table{{width:100%;border-collapse:collapse;font-size:.83rem}}
-  .meta-table td{{padding:7px 14px;border-bottom:1px solid #1e293b}}
+  .meta-table td{{padding:7px 14px;border-bottom:1px solid #0f172a}}
   .meta-table td:first-child{{color:#64748b;width:90px;white-space:nowrap}}
   .val{{color:#e2e8f0;word-break:break-all}}
   .url-cell a{{color:#60a5fa;text-decoration:none}}
@@ -465,13 +541,11 @@ def _build_html(results, summary, platform_filter):
   .err-msg{{color:#fca5a5;font-size:.78rem}}
   .source-url{{padding:8px 14px;font-size:.72rem;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
   .source-url a{{color:#475569;text-decoration:none}}
-  .source-url a:hover{{color:#94a3b8}}
   details summary{{padding:8px 14px;font-size:.8rem;color:#60a5fa;cursor:pointer;list-style:none}}
   details summary::-webkit-details-marker{{display:none}}
-  .fmt-table{{width:100%;border-collapse:collapse;font-size:.75rem;margin:0}}
+  .fmt-table{{width:100%;border-collapse:collapse;font-size:.75rem}}
   .fmt-table th{{background:#0f172a;color:#64748b;padding:5px 10px;text-align:left;font-weight:600}}
   .fmt-table td{{padding:4px 10px;border-top:1px solid #0f172a;color:#cbd5e1}}
-  .fmt-table tr:hover td{{background:#1e293b}}
   @media(max-width:600px){{.grid{{grid-template-columns:1fr}}}}
 </style>
 </head>
@@ -484,30 +558,30 @@ def _build_html(results, summary, platform_filter):
     <div class="score-num" style="color:{score_color}">{passed}/{total}</div>
     <div class="score-label">platforms passing</div>
   </div>
-  <div class="score-detail">
-    &#10003; {passed} OK &nbsp;&nbsp;
-    &#10007; {failed_real} real errors &nbsp;&nbsp;
-    &#128274; {failed_login} login required
-  </div>
+  <div class="score-detail">&#10003; {passed} OK &nbsp;&nbsp; &#10007; {failed_real} real errors &nbsp;&nbsp; &#128274; {failed_login} login blocked</div>
+</div>
+
+<div class="cookie-bar">
+  <span class="cookie-bar-label">&#127850; Cookies:</span>
+  {cookie_pills}
+  <a href="/api/cookies/status" style="margin-left:auto;font-size:.75rem;color:#475569;text-decoration:none">full status &#8599;</a>
 </div>
 
 <div class="filter-bar">
   <a href="/api/test" class="btn-plat btn-all">&#9654; All Platforms</a>
   {platform_buttons}
+  <a href="/api/test?format=json" class="btn-plat" style="margin-left:8px">{{ }} JSON</a>
 </div>
 
-<div class="grid">
-  {cards}
-</div>
-</body>
-</html>'''.format(
+<div class="grid">{cards}</div>
+</body></html>'''.format(
         score_color=score_color,
         ytdlp_ver=yt_dlp_version,
         api_ver=__version__,
-        total=total,
-        passed=passed,
+        total=total, passed=passed,
         failed_real=summary['failed_real_errors'],
         failed_login=summary['failed_login_required'],
+        cookie_pills=cookie_pills,
         platform_buttons=platform_buttons,
         cards=cards,
     )
@@ -517,36 +591,27 @@ def _build_html(results, summary, platform_filter):
 @route_api('test')
 @set_access_control
 def test_all_platforms():
-    """
-    Beautiful HTML dashboard showing full test results for all platforms.
-    /api/test                    -> test all platforms
-    /api/test?platform=youtube   -> test one platform
-    /api/test?format=json        -> raw JSON response
-    """
-    platform_filter  = request.args.get('platform', None)
-    response_format  = request.args.get('format', 'html')
+    platform_filter = request.args.get('platform', None)
+    response_format = request.args.get('format', 'html')
 
     urls_to_test = {
         k: v for k, v in TEST_URLS.items()
         if platform_filter is None or k == platform_filter
     }
 
-    results = {}
-    for platform, url in urls_to_test.items():
-        results[platform] = _run_test(platform, url)
+    results = {p: _run_test(p, u) for p, u in urls_to_test.items()}
 
-    total       = len(results)
-    passed      = sum(1 for r in results.values() if r['status'] == 'ok')
+    total           = len(results)
+    passed          = sum(1 for r in results.values() if r['status'] == 'ok')
     failed_no_login = [p for p, r in results.items() if r['status'] == 'error' and p not in LOGIN_REQUIRED]
     login_blocked   = [p for p, r in results.items() if r['status'] == 'error' and p in LOGIN_REQUIRED]
 
     summary = {
-        'total':                    total,
-        'passed':                   passed,
-        'failed_real_errors':       len(failed_no_login),
-        'failed_login_required':    len(login_blocked),
+        'total': total, 'passed': passed,
+        'failed_real_errors': len(failed_no_login),
+        'failed_login_required': len(login_blocked),
         'failed_real_error_platforms': failed_no_login,
-        'failed_login_platforms':   login_blocked,
+        'failed_login_platforms': login_blocked,
     }
 
     if response_format == 'json':
