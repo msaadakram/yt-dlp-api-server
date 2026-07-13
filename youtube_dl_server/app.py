@@ -1,16 +1,22 @@
 import functools
 import logging
 import os
+import re
 import tempfile
 import traceback
 import sys
 import time
 
-from flask import Flask, Blueprint, current_app, jsonify, request, redirect, abort, make_response
+from flask import Flask, Blueprint, current_app, jsonify, request, redirect, abort, make_response, Response, stream_with_context
 import yt_dlp
 from yt_dlp.version import __version__ as yt_dlp_version
 
 from .version import __version__
+
+try:
+    import urllib.request as urllib_req
+except ImportError:
+    import urllib2 as urllib_req
 
 
 if not hasattr(sys.stderr, 'isatty'):
@@ -81,41 +87,100 @@ DEFAULT_FORMAT = (
 )
 
 # ---------------------------------------------------------------
-# TEST URLS — verified live July 2026
+# Quality buckets for structured download links
 # ---------------------------------------------------------------
+VIDEO_HEIGHT_BUCKETS = [
+    (144,  '144p'),
+    (240,  '240p'),
+    (360,  '360p'),
+    (480,  '480p'),
+    (720,  '720p'),
+    (1080, '1080p'),
+    (1440, '1440p'),
+    (2160, '4K'),
+]
+
+AUDIO_BITRATE_BUCKETS = [
+    (64,  '64kbps'),
+    (96,  '96kbps'),
+    (128, '128kbps'),
+    (160, '160kbps'),
+    (192, '192kbps'),
+    (256, '256kbps'),
+    (320, '320kbps'),
+]
+
+PREFERRED_VIDEO_EXTS = ['mp4', 'webm', 'mkv', 'mov', 'avi', 'flv']
+PREFERRED_AUDIO_EXTS = ['mp3', 'm4a', 'aac', 'ogg', 'opus', 'webm', 'wav']
+
+
+def _bucket_height(h):
+    """Return human label for a pixel height."""
+    if not h:
+        return 'unknown'
+    for threshold, label in reversed(VIDEO_HEIGHT_BUCKETS):
+        if h >= threshold:
+            return label
+    return '{}p'.format(h)
+
+
+def _bucket_bitrate(tbr):
+    """Return human label for a bitrate (kbps)."""
+    if not tbr:
+        return 'unknown'
+    for threshold, label in reversed(AUDIO_BITRATE_BUCKETS):
+        if tbr >= threshold:
+            return label
+    return '{}kbps'.format(int(tbr))
+
+
+def _safe_filename(title):
+    """Sanitise a video title for use as a filename."""
+    name = re.sub(r'[\\/:*?"<>|]', '_', title or 'video')
+    return name[:80].strip()
+
+
+def _fmt_bytes(b):
+    if not b:
+        return None
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if b < 1024:
+            return '{:.1f} {}'.format(b, unit)
+        b /= 1024
+    return '{:.1f} TB'.format(b)
+
+
+def _fmt_dur(s):
+    if not s or s == 'N/A':
+        return 'N/A'
+    try:
+        s = int(s)
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return '{:d}:{:02d}:{:02d}'.format(h, m, sec)
+        return '{:d}:{:02d}'.format(m, sec)
+    except Exception:
+        return str(s)
+
+
+# ---------------------------------------------------------------
+# Core yt-dlp extraction
+# ---------------------------------------------------------------
+
 TEST_URLS = {
-    # yt-dlp official test video
-    'youtube':      'https://www.youtube.com/watch?v=BaW_jenozKc',
-
-    # Khaby Lame — 15.7M views, confirmed live
-    'tiktok':       'https://www.tiktok.com/@khaby.lame/video/7646812028874673439',
-
-    # Dailymotion — recent news clip, confirmed live
-    'dailymotion':  'https://www.dailymotion.com/video/xaedfou',
-
-    # Vimeo — classic public test video
-    'vimeo':        'https://vimeo.com/76979871',
-
-    # SoundCloud — always public
-    'soundcloud':   'https://soundcloud.com/forss/flickermood',
-
-    # Twitter/X — needs login cookies for video extraction
-    'twitter':      'https://x.com/i/status/1876345576239841773',
-
-    # Twitch — confirmed live clip
-    'twitch':       'https://clips.twitch.tv/AttractiveObliviousFerretTheTarFu-gbLQE2LoKjjzgEMk',
-
-    # Instagram — NASA public reel (large verified account, reliable)
-    'instagram':    'https://www.instagram.com/reel/C8p1oWXuF3N/',
-
-    # Facebook — NASA public video (public page, no login wall)
-    'facebook':     'https://www.facebook.com/NASA/videos/1539781023275888/',
-
-    # Reddit — real video post on r/nextfuckinglevel (verified exists)
-    'reddit':       'https://www.reddit.com/r/nextfuckinglevel/comments/1cqxrdl/this_soccer_player_is_absolutely_insane/',
+    'youtube':     'https://www.youtube.com/watch?v=BaW_jenozKc',
+    'tiktok':      'https://www.tiktok.com/@khaby.lame/video/7646812028874673439',
+    'dailymotion': 'https://www.dailymotion.com/video/xaedfou',
+    'vimeo':       'https://vimeo.com/76979871',
+    'soundcloud':  'https://soundcloud.com/forss/flickermood',
+    'twitter':     'https://x.com/i/status/1876345576239841773',
+    'twitch':      'https://clips.twitch.tv/AttractiveObliviousFerretTheTarFu-gbLQE2LoKjjzgEMk',
+    'instagram':   'https://www.instagram.com/reel/C8p1oWXuF3N/',
+    'facebook':    'https://www.facebook.com/NASA/videos/1539781023275888/',
+    'reddit':      'https://www.reddit.com/r/nextfuckinglevel/comments/1cqxrdl/this_soccer_player_is_absolutely_insane/',
 }
 
-# Platforms that need login cookies — twitter also needs them for video
 LOGIN_REQUIRED = {'instagram', 'facebook', 'reddit', 'twitter'}
 
 PLATFORM_ICONS = {
@@ -138,11 +203,10 @@ class SimpleYDL(yt_dlp.YoutubeDL):
         self.add_default_info_extractors()
 
 
-def get_videos(url, extra_params):
-    ydl_params = {
-        'format': DEFAULT_FORMAT,
+def _base_ydl_params(url, logger=None):
+    params = {
+        'format': 'bestvideo+bestaudio/best',
         'cachedir': False,
-        'logger': current_app.logger.getChild('youtube-dl'),
         'ignore_no_formats_error': True,
         'extractor_retries': 3,
         'skip_unavailable_fragments': True,
@@ -153,9 +217,19 @@ def get_videos(url, extra_params):
             }
         },
     }
+    if logger:
+        params['logger'] = logger
+    else:
+        params['quiet'] = True
+        params['no_warnings'] = True
     cookies_path = _get_cookies_for_url(url)
     if cookies_path:
-        ydl_params['cookiefile'] = cookies_path
+        params['cookiefile'] = cookies_path
+    return params
+
+
+def get_videos(url, extra_params):
+    ydl_params = _base_ydl_params(url, logger=current_app.logger.getChild('youtube-dl'))
     ydl_params.update(extra_params)
     ydl = SimpleYDL(ydl_params)
     res = ydl.extract_info(url, download=False)
@@ -165,18 +239,154 @@ def get_videos(url, extra_params):
 def flatten_result(result):
     r_type = result.get('_type', 'video')
     if r_type == 'video':
-        videos = [result]
-    elif r_type == 'playlist':
-        videos = []
-        for entry in result['entries']:
-            videos.extend(flatten_result(entry))
-    elif r_type == 'compat_list':
-        videos = []
-        for r in result['entries']:
-            videos.extend(flatten_result(r))
+        return [result]
+    videos = []
+    for entry in result.get('entries', []):
+        videos.extend(flatten_result(entry))
     return videos
 
 
+# ---------------------------------------------------------------
+# /api/fetch — main download-links endpoint
+# ---------------------------------------------------------------
+
+def _build_download_links(info, base_url):
+    """
+    Build structured video + audio download link lists from yt-dlp info dict.
+    base_url: Flask request base (e.g. https://myserver.com) for proxy links.
+    """
+    formats = info.get('formats') or []
+    title   = info.get('title', 'video')
+    safe_fn = _safe_filename(title)
+
+    seen_video_heights = {}
+    seen_audio_keys   = {}
+
+    video_links = []
+    audio_links = []
+
+    for f in formats:
+        furl   = f.get('url', '')
+        vcodec = f.get('vcodec', 'none') or 'none'
+        acodec = f.get('acodec', 'none') or 'none'
+        height = f.get('height')
+        width  = f.get('width')
+        ext    = f.get('ext', 'mp4') or 'mp4'
+        tbr    = f.get('tbr')
+        abr    = f.get('abr') or tbr
+        fsize  = f.get('filesize') or f.get('filesize_approx')
+        fmt_id = f.get('format_id', '')
+
+        if not furl:
+            continue
+
+        # --- VIDEO formats (has video stream) ---
+        if vcodec != 'none' and height:
+            bucket = _bucket_height(height)
+            # prefer mp4 over other exts per bucket
+            existing = seen_video_heights.get(bucket)
+            prefer_this = (
+                existing is None or
+                (ext == 'mp4' and existing['ext'] != 'mp4') or
+                (ext == existing['ext'] and (fsize or 0) > (existing.get('filesize_bytes') or 0))
+            )
+            if prefer_this:
+                entry = {
+                    'quality':        bucket,
+                    'height':         height,
+                    'width':          width,
+                    'ext':            ext,
+                    'vcodec':         vcodec,
+                    'acodec':         acodec,
+                    'has_audio':      acodec != 'none',
+                    'tbr_kbps':       round(tbr) if tbr else None,
+                    'filesize':       _fmt_bytes(fsize),
+                    'filesize_bytes': fsize,
+                    'format_id':      fmt_id,
+                    'direct_url':     furl,
+                    'proxy_url':      '{}api/proxy?url={}&filename={}.{}'.format(
+                                          base_url,
+                                          urllib_req.quote(furl, safe=''),
+                                          urllib_req.quote(safe_fn, safe=''),
+                                          ext
+                                      ),
+                }
+                seen_video_heights[bucket] = entry
+
+        # --- AUDIO-only formats ---
+        elif vcodec == 'none' and acodec != 'none':
+            bucket = _bucket_bitrate(abr)
+            key    = '{}_{}'.format(ext, bucket)
+            existing = seen_audio_keys.get(key)
+            prefer_this = (
+                existing is None or
+                (fsize or 0) > (existing.get('filesize_bytes') or 0)
+            )
+            if prefer_this:
+                entry = {
+                    'quality':        bucket,
+                    'ext':            ext,
+                    'acodec':         acodec,
+                    'abr_kbps':       round(abr) if abr else None,
+                    'filesize':       _fmt_bytes(fsize),
+                    'filesize_bytes': fsize,
+                    'format_id':      fmt_id,
+                    'direct_url':     furl,
+                    'proxy_url':      '{}api/proxy?url={}&filename={}.{}'.format(
+                                          base_url,
+                                          urllib_req.quote(furl, safe=''),
+                                          urllib_req.quote(safe_fn, safe=''),
+                                          ext
+                                      ),
+                }
+                seen_audio_keys[key] = entry
+
+    # Sort by height desc for video, bitrate desc for audio
+    for bucket_label in ['4K','1440p','1080p','720p','480p','360p','240p','144p']:
+        if bucket_label in seen_video_heights:
+            video_links.append(seen_video_heights[bucket_label])
+
+    # sort audio by ext preference then bitrate desc
+    audio_sorted = sorted(
+        seen_audio_keys.values(),
+        key=lambda x: (
+            PREFERRED_AUDIO_EXTS.index(x['ext']) if x['ext'] in PREFERRED_AUDIO_EXTS else 99,
+            -(x['abr_kbps'] or 0)
+        )
+    )
+    audio_links = audio_sorted
+
+    # Best picks
+    best_video = video_links[0] if video_links else None
+    best_audio = next(
+        (a for a in audio_links if a['ext'] in ('mp3','m4a')),
+        audio_links[0] if audio_links else None
+    )
+
+    # If platform returns a single merged stream (no separate formats)
+    fallback_url = info.get('url') or info.get('webpage_url')
+    if not video_links and not audio_links and fallback_url:
+        ext = info.get('ext', 'mp4') or 'mp4'
+        fallback_entry = {
+            'quality':    'best',
+            'ext':        ext,
+            'direct_url': fallback_url,
+            'proxy_url':  '{}api/proxy?url={}&filename={}.{}'.format(
+                              base_url,
+                              urllib_req.quote(fallback_url, safe=''),
+                              urllib_req.quote(safe_fn, safe=''),
+                              ext
+                          ),
+        }
+        video_links.append(fallback_entry)
+        best_video = fallback_entry
+
+    return video_links, audio_links, best_video, best_audio
+
+
+# ---------------------------------------------------------------
+# Flask Blueprint
+# ---------------------------------------------------------------
 api = Blueprint('api', __name__)
 
 
@@ -189,6 +399,7 @@ def set_access_control(f):
     def wrapper(*args, **kargs):
         response = f(*args, **kargs)
         response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
         return response
     return wrapper
 
@@ -204,7 +415,7 @@ def handle_youtube_dl_error(error):
 
 class WrongParameterTypeError(ValueError):
     def __init__(self, value, type, parameter):
-        message = '"{}\" expects a {}, got \"{}\"'.format(parameter, type, value)
+        message = '"{}" expects a {}, got "{}"'.format(parameter, type, value)
         super(WrongParameterTypeError, self).__init__(message)
 
 
@@ -266,6 +477,234 @@ def get_result():
     return get_videos(url, extra_params)
 
 
+# ================================================================
+#  /api/fetch  — THE MAIN ENDPOINT
+# ================================================================
+@route_api('fetch')
+@set_access_control
+def fetch():
+    """
+    GET /api/fetch?url=<VIDEO_URL>
+
+    Returns JSON with:
+      - metadata: title, uploader, duration, thumbnail, views, description
+      - video_links: array of {quality, ext, direct_url, proxy_url, filesize, ...}
+                     sorted 4K -> 1080p -> 720p -> 480p -> 360p -> 240p -> 144p
+      - audio_links: array of {ext, quality, direct_url, proxy_url, ...}
+                     mp3/m4a preferred, sorted by bitrate desc
+      - best_video: single best video link object
+      - best_audio: single best audio link (mp3 or m4a preferred)
+
+    Optional params:
+      ?qualities=720p,1080p   filter video_links to these qualities only
+      ?audio_only=true        return only audio_links
+      ?video_only=true        return only video_links
+      ?ext=mp4                filter by extension
+    """
+    url = request.args.get('url')
+    if not url:
+        return jsonify({'error': 'Missing required parameter: url'}), 400
+
+    qualities_filter = request.args.get('qualities')  # e.g. "720p,1080p"
+    audio_only  = query_bool(request.args.get('audio_only'), 'audio_only', False)
+    video_only  = query_bool(request.args.get('video_only'), 'video_only', False)
+    ext_filter  = request.args.get('ext')  # e.g. "mp4"
+
+    t0 = time.time()
+    try:
+        ydl_params = _base_ydl_params(url)
+        with yt_dlp.YoutubeDL(ydl_params) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return jsonify({
+            'status':  'error',
+            'url':     url,
+            'error':   str(e),
+            'elapsed': round(time.time() - t0, 2),
+        }), 500
+
+    # Base URL for proxy links (e.g. "https://myserver.com/")
+    base_url = request.host_url
+
+    video_links, audio_links, best_video, best_audio = _build_download_links(info, base_url)
+
+    # Apply optional filters
+    if qualities_filter:
+        wanted = [q.strip() for q in qualities_filter.split(',')]
+        video_links = [v for v in video_links if v['quality'] in wanted]
+    if ext_filter:
+        video_links = [v for v in video_links if v['ext'] == ext_filter]
+        audio_links = [a for a in audio_links if a['ext'] == ext_filter]
+    if audio_only:
+        video_links = []
+    if video_only:
+        audio_links = []
+
+    # Collect all thumbnails (some platforms have multiple)
+    thumbnails = []
+    for t in (info.get('thumbnails') or []):
+        if t.get('url'):
+            thumbnails.append({
+                'url':    t['url'],
+                'width':  t.get('width'),
+                'height': t.get('height'),
+                'id':     t.get('id', ''),
+            })
+    best_thumbnail = info.get('thumbnail') or (thumbnails[-1]['url'] if thumbnails else None)
+
+    result = {
+        'status':   'ok',
+        'url':      url,
+        'elapsed':  round(time.time() - t0, 2),
+        'metadata': {
+            'title':       info.get('title'),
+            'uploader':    info.get('uploader') or info.get('channel'),
+            'uploader_url':info.get('uploader_url') or info.get('channel_url'),
+            'duration_sec':info.get('duration'),
+            'duration':    _fmt_dur(info.get('duration')),
+            'view_count':  info.get('view_count'),
+            'like_count':  info.get('like_count'),
+            'upload_date': info.get('upload_date'),
+            'description': (info.get('description') or '')[:500],
+            'platform':    info.get('extractor_key', '').lower(),
+            'webpage_url': info.get('webpage_url'),
+            'thumbnail':   best_thumbnail,
+            'thumbnails':  thumbnails,
+        },
+        'video_links': video_links,
+        'audio_links': audio_links,
+        'best_video':  best_video,
+        'best_audio':  best_audio,
+        'total_video_formats': len(video_links),
+        'total_audio_formats': len(audio_links),
+    }
+    return jsonify(result)
+
+
+# ================================================================
+#  /api/proxy  — stream CDN URL through server as download
+# ================================================================
+@route_api('proxy')
+def proxy_download():
+    """
+    GET /api/proxy?url=<DIRECT_CDN_URL>&filename=video.mp4
+
+    Streams the CDN URL through the server with Content-Disposition: attachment.
+    Use this when direct CDN links expire or block hotlinking.
+    """
+    cdn_url  = request.args.get('url')
+    filename = request.args.get('filename', 'video.mp4')
+    if not cdn_url:
+        return jsonify({'error': 'Missing url parameter'}), 400
+
+    # Sanitise filename
+    filename = re.sub(r'[^\w\-\.]+', '_', filename)[:120]
+
+    import urllib.request as ur
+    req = ur.Request(cdn_url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/124.0.0.0 Safari/537.36',
+        'Referer':    cdn_url.split('?')[0],
+    })
+
+    try:
+        remote = ur.urlopen(req, timeout=30)
+    except Exception as e:
+        return jsonify({'error': 'Failed to open stream: {}'.format(str(e))}), 502
+
+    content_type   = remote.headers.get('Content-Type', 'application/octet-stream')
+    content_length = remote.headers.get('Content-Length', '')
+
+    def generate():
+        try:
+            while True:
+                chunk = remote.read(512 * 1024)  # 512 KB chunks
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            remote.close()
+
+    headers = {
+        'Content-Disposition': 'attachment; filename="{}"'.format(filename),
+        'Content-Type':        content_type,
+        'Access-Control-Allow-Origin': '*',
+    }
+    if content_length:
+        headers['Content-Length'] = content_length
+
+    return Response(
+        stream_with_context(generate()),
+        headers=headers,
+        status=200,
+    )
+
+
+# ================================================================
+#  /api/stream  — inline browser streaming (no download dialog)
+# ================================================================
+@route_api('stream')
+def stream_video():
+    """
+    GET /api/stream?url=<DIRECT_CDN_URL>
+
+    Streams video inline (for <video> src or browser preview).
+    Supports Range header for seek support.
+    """
+    cdn_url = request.args.get('url')
+    if not cdn_url:
+        return jsonify({'error': 'Missing url parameter'}), 400
+
+    import urllib.request as ur
+    range_header = request.headers.get('Range', '')
+    req_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/124.0.0.0 Safari/537.36',
+        'Referer': cdn_url.split('?')[0],
+    }
+    if range_header:
+        req_headers['Range'] = range_header
+
+    req = ur.Request(cdn_url, headers=req_headers)
+    try:
+        remote = ur.urlopen(req, timeout=30)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
+
+    content_type   = remote.headers.get('Content-Type', 'video/mp4')
+    content_length = remote.headers.get('Content-Length', '')
+    status_code    = remote.status if hasattr(remote, 'status') else 200
+
+    def generate():
+        try:
+            while True:
+                chunk = remote.read(512 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            remote.close()
+
+    headers = {
+        'Content-Type':              content_type,
+        'Accept-Ranges':             'bytes',
+        'Access-Control-Allow-Origin': '*',
+    }
+    if content_length:
+        headers['Content-Length'] = content_length
+
+    return Response(
+        stream_with_context(generate()),
+        headers=headers,
+        status=status_code,
+    )
+
+
+# ================================================================
+#  Legacy / existing endpoints (unchanged)
+# ================================================================
 @route_api('info')
 @set_access_control
 def info():
@@ -322,27 +761,14 @@ def cookies_status():
     return jsonify({'cookies': status})
 
 
+# ================================================================
+#  Test dashboard (unchanged)
+# ================================================================
 def _run_test(platform, url):
     t0 = time.time()
     try:
-        ydl_params = {
-            'format': DEFAULT_FORMAT,
-            'cachedir': False,
-            'quiet': True,
-            'no_warnings': True,
-            'ignore_no_formats_error': True,
-            'extractor_retries': 2,
-            'skip_unavailable_fragments': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['web', 'mweb', 'tv_embedded', 'android', 'ios'],
-                    'skip': ['translated_subs'],
-                }
-            },
-        }
-        cookies_path = _get_cookies_for_url(url)
-        if cookies_path:
-            ydl_params['cookiefile'] = cookies_path
+        ydl_params = _base_ydl_params(url)
+        ydl_params['extractor_retries'] = 2
 
         with yt_dlp.YoutubeDL(ydl_params) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -375,7 +801,7 @@ def _run_test(platform, url):
             'formats_available': len(formats),
             'formats':           fmt_list,
             'direct_url':        direct_url,
-            'cookies_used':      bool(cookies_path),
+            'cookies_used':      bool(_get_cookies_for_url(url)),
             'login_required':    platform in LOGIN_REQUIRED,
             'elapsed_sec':       elapsed,
         }
@@ -391,26 +817,6 @@ def _run_test(platform, url):
         }
 
 
-def _fmt_bytes(b):
-    if not b:
-        return 'N/A'
-    for unit in ['B','KB','MB','GB']:
-        if b < 1024:
-            return '{:.1f} {}'.format(b, unit)
-        b /= 1024
-    return '{:.1f} TB'.format(b)
-
-
-def _fmt_dur(s):
-    if not s or s == 'N/A':
-        return 'N/A'
-    try:
-        s = int(s)
-        return '{}:{:02d}'.format(s // 60, s % 60)
-    except Exception:
-        return str(s)
-
-
 def _build_html(results, summary, platform_filter):
     passed = summary['passed']
     total  = summary['total']
@@ -421,7 +827,7 @@ def _build_html(results, summary, platform_filter):
     for var in cookie_vars:
         configured = bool(os.environ.get(var, ''))
         label = var.replace('_COOKIES','')
-        cookie_pills += '<span class="cpill {}\">{} {}</span>'.format(
+        cookie_pills += '<span class="cpill {}">{} {}</span>'.format(
             'cpill-ok' if configured else 'cpill-no',
             '\u2714' if configured else '\u2717',
             label
@@ -429,9 +835,9 @@ def _build_html(results, summary, platform_filter):
 
     cards = ''
     for platform, r in sorted(results.items()):
-        icon     = PLATFORM_ICONS.get(platform, '\U0001f310')
-        is_ok    = r['status'] == 'ok'
-        is_login = r.get('login_required', False)
+        icon         = PLATFORM_ICONS.get(platform, '\U0001f310')
+        is_ok        = r['status'] == 'ok'
+        is_login     = r.get('login_required', False)
         cookies_used = r.get('cookies_used', False)
         status_badge = (
             '<span class="badge ok">&#10003; OK</span>' if is_ok else
@@ -442,7 +848,7 @@ def _build_html(results, summary, platform_filter):
 
         thumb_html = ''
         if is_ok and r.get('thumbnail'):
-            thumb_html = '<img src=\"{}\" class="thumb" alt="thumbnail">'.format(r['thumbnail'])
+            thumb_html = '<img src="{}" class="thumb" alt="thumbnail">'.format(r['thumbnail'])
 
         meta_rows = ''
         if is_ok:
@@ -454,8 +860,7 @@ def _build_html(results, summary, platform_filter):
             meta_rows += '<tr><td>Formats</td><td class="val">{}</td></tr>'.format(r.get('formats_available',0))
             meta_rows += '<tr><td>Elapsed</td><td class="val">{} s</td></tr>'.format(r.get('elapsed_sec'))
             if r.get('direct_url'):
-                meta_rows += '<tr><td>Direct URL</td><td class="val url-cell"><a href=\"{}\" target="_blank">Open stream &#8599;</a></td></tr>'.format(r['direct_url'])
-
+                meta_rows += '<tr><td>Direct URL</td><td class="val url-cell"><a href="{}" target="_blank">Open stream &#8599;</a></td></tr>'.format(r['direct_url'])
             fmts = r.get('formats', [])
             fmt_table = ''
             if fmts:
@@ -559,7 +964,6 @@ def _build_html(results, summary, platform_filter):
 <body>
 <h1>&#127916; yt-dlp API &mdash; Platform Test Dashboard</h1>
 <p class="subtitle">yt-dlp v{ytdlp_ver} &nbsp;&bull;&nbsp; API Server v{api_ver} &nbsp;&bull;&nbsp; Tested {total} platforms</p>
-
 <div class="score-bar">
   <div>
     <div class="score-num" style="color:{score_color}">{passed}/{total}</div>
@@ -567,19 +971,16 @@ def _build_html(results, summary, platform_filter):
   </div>
   <div class="score-detail">&#10003; {passed} OK &nbsp;&nbsp; &#10007; {failed_real} real errors &nbsp;&nbsp; &#128274; {failed_login} login blocked</div>
 </div>
-
 <div class="cookie-bar">
   <span class="cookie-bar-label">&#127850; Cookies:</span>
   {cookie_pills}
   <a href="/api/cookies/status" style="margin-left:auto;font-size:.75rem;color:#475569;text-decoration:none">full status &#8599;</a>
 </div>
-
 <div class="filter-bar">
   <a href="/api/test?format=html" class="btn-plat btn-all">&#9654; All Platforms</a>
   {platform_buttons}
   <a href="/api/test" class="btn-plat btn-json" style="margin-left:8px">&#123;&#125; JSON</a>
 </div>
-
 <div class="grid">{cards}</div>
 </body></html>'''.format(
         score_color=score_color,
@@ -598,27 +999,17 @@ def _build_html(results, summary, platform_filter):
 @route_api('test')
 @set_access_control
 def test_all_platforms():
-    """
-    /api/test                      -> JSON (default)
-    /api/test?format=html          -> HTML dashboard
-    /api/test?platform=youtube     -> single platform JSON
-    /api/test?platform=youtube&format=html -> single platform HTML
-    """
     platform_filter = request.args.get('platform', None)
     response_format = request.args.get('format', 'json')
-
     urls_to_test = {
         k: v for k, v in TEST_URLS.items()
         if platform_filter is None or k == platform_filter
     }
-
     results = {p: _run_test(p, u) for p, u in urls_to_test.items()}
-
     total           = len(results)
     passed          = sum(1 for r in results.values() if r['status'] == 'ok')
     failed_no_login = [p for p, r in results.items() if r['status'] == 'error' and p not in LOGIN_REQUIRED]
     login_blocked   = [p for p, r in results.items() if r['status'] == 'error' and p in LOGIN_REQUIRED]
-
     summary = {
         'total': total, 'passed': passed,
         'failed_real_errors': len(failed_no_login),
@@ -626,13 +1017,11 @@ def test_all_platforms():
         'failed_real_error_platforms': failed_no_login,
         'failed_login_platforms': login_blocked,
     }
-
     if response_format == 'html':
         html = _build_html(results, summary, platform_filter)
         resp = make_response(html)
         resp.headers['Content-Type'] = 'text/html; charset=utf-8'
         return resp
-
     return jsonify({'summary': summary, 'results': results})
 
 
