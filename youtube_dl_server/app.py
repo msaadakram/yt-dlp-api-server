@@ -51,26 +51,26 @@ DEFAULT_FORMAT = (
 # REAL verified live URLs - searched & confirmed July 2026
 # ---------------------------------------------------------------
 TEST_URLS = {
-    # yt-dlp official test video - always exists
+    # yt-dlp official test video
     'youtube':      'https://www.youtube.com/watch?v=BaW_jenozKc',
 
     # Khaby Lame - June 2026 video (1.4M likes, confirmed live)
     'tiktok':       'https://www.tiktok.com/@khaby.lame/video/7646812028874673439',
 
-    # Dailymotion - telesur World Cup video published June 2026
+    # Dailymotion - confirmed live June 2026
     'dailymotion':  'https://www.dailymotion.com/video/xaedfou',
 
-    # Vimeo - classic public test video, always available
+    # Vimeo - classic public test video
     'vimeo':        'https://vimeo.com/76979871',
 
-    # SoundCloud - Forss flickermood (classic public track, always up)
+    # SoundCloud - Forss flickermood (always public)
     'soundcloud':   'https://soundcloud.com/forss/flickermood',
 
-    # Twitter/X public video
-    'twitter':      'https://twitter.com/i/status/1804553550801391673',
+    # Twitter/X - use nitter-compatible format
+    'twitter':      'https://x.com/i/status/1876345576239841773',
 
-    # Twitch public clip (clips never expire)
-    'twitch':       'https://clips.twitch.tv/AgreeableElegantTarsierWoofer-pDCNqN9GUAVtxhp7',
+    # Twitch clip - confirmed live April 2026
+    'twitch':       'https://clips.twitch.tv/AttractiveObliviousFerretTheTarFu-gbLQE2LoKjjzgEMk',
 
     # Instagram - needs login (expected to fail without cookies)
     'instagram':    'https://www.instagram.com/reel/C9W0JHjIGdL/',
@@ -82,7 +82,7 @@ TEST_URLS = {
     'reddit':       'https://www.reddit.com/r/oddlysatisfying/comments/1dummyid/satisfying_video/',
 }
 
-# Platforms that are expected to fail without cookies
+# Platforms expected to fail without cookies
 LOGIN_REQUIRED = {'instagram', 'facebook', 'reddit'}
 
 
@@ -102,7 +102,7 @@ def get_videos(url, extra_params):
         'skip_unavailable_fragments': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['web', 'android', 'ios'],
+                'player_client': ['web', 'tv_embedded', 'android', 'ios'],
                 'skip': ['translated_subs'],
             }
         },
@@ -268,14 +268,8 @@ def version():
 def test_all_platforms():
     """
     Test all platforms with real verified live URLs.
-    /api/test                    -> test all 10 platforms
-    /api/test?platform=youtube   -> test one platform
-    /api/test?platform=tiktok
-    /api/test?platform=vimeo
-    /api/test?platform=dailymotion
-    /api/test?platform=soundcloud
-    /api/test?platform=twitter
-    /api/test?platform=twitch
+    /api/test                      -> test all
+    /api/test?platform=youtube     -> test one
     """
     platform_filter = request.args.get('platform', None)
     urls_to_test = {
@@ -296,7 +290,7 @@ def test_all_platforms():
                 'skip_unavailable_fragments': True,
                 'extractor_args': {
                     'youtube': {
-                        'player_client': ['web', 'android', 'ios'],
+                        'player_client': ['web', 'tv_embedded', 'android', 'ios'],
                         'skip': ['translated_subs'],
                     }
                 },
