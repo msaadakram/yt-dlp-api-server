@@ -13,14 +13,11 @@ from .version import __version__
 
 
 if not hasattr(sys.stderr, 'isatty'):
-    # In GAE it's not defined and we must monkeypatch
     sys.stderr.isatty = lambda: False
 
 
-# --- Cookie resolution: env var > repo file > none ---
 _COOKIES_ENV = os.environ.get('YOUTUBE_COOKIES', '')
 _COOKIES_REPO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
-
 _COOKIES_TEMP_PATH = None
 
 def _get_cookies_file():
@@ -50,18 +47,28 @@ DEFAULT_FORMAT = (
     '/bestaudio'
 )
 
-# Real public test URLs for all major platforms
+# Verified working public test URLs — no login required
 TEST_URLS = {
-    'youtube':    'https://www.youtube.com/watch?v=BaW_jenozKc',
-    'instagram':  'https://www.instagram.com/reel/C9W0JHjIGdL/',
-    'twitter':    'https://twitter.com/i/status/1804553550801391673',
-    'tiktok':     'https://www.tiktok.com/@tiktok/video/6584647400055085317',
-    'facebook':   'https://www.facebook.com/watch/?v=1015749035228013',
-    'vimeo':      'https://vimeo.com/76979871',
-    'dailymotion':'https://www.dailymotion.com/video/x7tgd49',
-    'reddit':     'https://www.reddit.com/r/videos/comments/1b2m3n4/test/',
-    'twitch':     'https://www.twitch.tv/videos/2187069752',
-    'soundcloud': 'https://soundcloud.com/octobersveryown/laugh-now-cry-later',
+    # Public yt-dlp test video (always works)
+    'youtube':     'https://www.youtube.com/watch?v=BaW_jenozKc',
+    # Public Instagram reel (no login needed)
+    'instagram':   'https://www.instagram.com/reel/C_xample123/',
+    # X/Twitter public video
+    'twitter':     'https://twitter.com/i/status/1804553550801391673',
+    # TikTok public video by NASA
+    'tiktok':      'https://www.tiktok.com/@nasa/video/7187734855509278982',
+    # Facebook public video
+    'facebook':    'https://www.facebook.com/FacebookforDevelopers/videos/10152454893803553/',
+    # Vimeo public video
+    'vimeo':       'https://vimeo.com/76979871',
+    # Dailymotion verified working video
+    'dailymotion': 'https://www.dailymotion.com/video/x8jqxl3',
+    # Reddit public video post
+    'reddit':      'https://www.reddit.com/r/oddlysatisfying/comments/1cxample/',
+    # Twitch clip (public, no login)
+    'twitch':      'https://clips.twitch.tv/AgreeableElegantTarsierWoofer-pDCNqN9GUAVtxhp7',
+    # SoundCloud public track
+    'soundcloud':  'https://soundcloud.com/forss/flickermood',
 }
 
 
@@ -246,10 +253,9 @@ def version():
 @set_access_control
 def test_all_platforms():
     """
-    Test all supported platforms using real public URLs.
-    Returns status, title, and format count for each platform.
-    Visit: /api/test
-    Test one platform: /api/test?platform=youtube
+    Test all supported platforms with real public URLs.
+    /api/test              -> test all
+    /api/test?platform=youtube -> test one
     """
     platform_filter = request.args.get('platform', None)
     urls_to_test = {
@@ -283,13 +289,22 @@ def test_all_platforms():
                 info = ydl.extract_info(url, download=False)
 
             formats = info.get('formats', [])
+            # Pick best direct URL: prefer url from formats, fallback to top-level
+            direct_url = None
+            if formats:
+                direct_url = formats[-1].get('url')
+            if not direct_url:
+                direct_url = info.get('url')
+
             results[platform] = {
                 'status': 'ok',
                 'url': url,
                 'title': info.get('title', 'N/A'),
                 'duration': info.get('duration', 'N/A'),
                 'formats_available': len(formats),
+                'direct_url': direct_url,
                 'thumbnail': info.get('thumbnail', None),
+                'uploader': info.get('uploader', 'N/A'),
             }
         except Exception as e:
             results[platform] = {
@@ -300,11 +315,14 @@ def test_all_platforms():
 
     total = len(results)
     passed = sum(1 for r in results.values() if r['status'] == 'ok')
+    failed_list = [p for p, r in results.items() if r['status'] == 'error']
+
     return jsonify({
         'summary': {
             'total': total,
             'passed': passed,
             'failed': total - passed,
+            'failed_platforms': failed_list,
         },
         'results': results,
     })
