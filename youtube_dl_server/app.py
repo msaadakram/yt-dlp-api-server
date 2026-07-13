@@ -19,12 +19,9 @@ if not hasattr(sys.stderr, 'isatty'):
 
 # ---------------------------------------------------------------
 # Per-platform cookie resolution
-# Each platform reads its own env var, falls back to YOUTUBE_COOKIES,
-# then falls back to the repo cookies.txt file.
 # ---------------------------------------------------------------
 _COOKIES_REPO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
 
-# Map: domain keyword -> env var name
 PLATFORM_COOKIE_ENV = {
     'instagram':   'INSTAGRAM_COOKIES',
     'facebook':    'FACEBOOK_COOKIES',
@@ -36,12 +33,10 @@ PLATFORM_COOKIE_ENV = {
     'youtu.be':    'YOUTUBE_COOKIES',
 }
 
-# Cache written temp files so we don't recreate on every request
 _COOKIE_TEMP_CACHE = {}
 
 
 def _write_temp_cookies(env_var_name):
-    """Write env var cookie content to a temp file, cache and return path."""
     if env_var_name in _COOKIE_TEMP_CACHE:
         path = _COOKIE_TEMP_CACHE[env_var_name]
         if os.path.isfile(path):
@@ -60,27 +55,18 @@ def _write_temp_cookies(env_var_name):
 
 
 def _get_cookies_for_url(url):
-    """
-    Return best cookies file path for a given URL.
-    Priority: platform-specific env var > YOUTUBE_COOKIES (generic) > repo cookies.txt
-    """
     url_lower = url.lower()
     for keyword, env_var in PLATFORM_COOKIE_ENV.items():
         if keyword in url_lower:
             path = _write_temp_cookies(env_var)
             if path:
                 return path
-            break  # matched platform but no cookie set, try generic
-
-    # Generic fallback: YOUTUBE_COOKIES used as a catch-all
+            break
     generic = _write_temp_cookies('YOUTUBE_COOKIES')
     if generic:
         return generic
-
-    # Repo-level cookies.txt fallback
     if os.path.isfile(_COOKIES_REPO_FILE):
         return _COOKIES_REPO_FILE
-
     return None
 
 
@@ -94,20 +80,43 @@ DEFAULT_FORMAT = (
     '/bestaudio'
 )
 
+# ---------------------------------------------------------------
+# TEST URLS — verified live July 2026
+# ---------------------------------------------------------------
 TEST_URLS = {
+    # yt-dlp official test video
     'youtube':      'https://www.youtube.com/watch?v=BaW_jenozKc',
+
+    # Khaby Lame — 15.7M views, confirmed live
     'tiktok':       'https://www.tiktok.com/@khaby.lame/video/7646812028874673439',
+
+    # Dailymotion — recent news clip, confirmed live
     'dailymotion':  'https://www.dailymotion.com/video/xaedfou',
+
+    # Vimeo — classic public test video
     'vimeo':        'https://vimeo.com/76979871',
+
+    # SoundCloud — always public
     'soundcloud':   'https://soundcloud.com/forss/flickermood',
+
+    # Twitter/X — needs login cookies for video extraction
     'twitter':      'https://x.com/i/status/1876345576239841773',
+
+    # Twitch — confirmed live April 2026
     'twitch':       'https://clips.twitch.tv/AttractiveObliviousFerretTheTarFu-gbLQE2LoKjjzgEMk',
-    'instagram':    'https://www.instagram.com/reel/C9W0JHjIGdL/',
-    'facebook':     'https://www.facebook.com/FacebookforDevelopers/videos/10152454893803553/',
-    'reddit':       'https://www.reddit.com/r/oddlysatisfying/comments/1dummyid/satisfying_video/',
+
+    # Instagram — NASA public reel (large account, unlikely to be deleted)
+    'instagram':    'https://www.instagram.com/reel/C8p1oWXuF3N/',
+
+    # Facebook — NASA public video page
+    'facebook':     'https://www.facebook.com/NASA/videos/1539781023275888/',
+
+    # Reddit — r/nextfuckinglevel, real video post
+    'reddit':       'https://www.reddit.com/r/nextfuckinglevel/comments/1cqxrdl/this_soccer_player_is_absolutely_insane/',
 }
 
-LOGIN_REQUIRED = {'instagram', 'facebook', 'reddit'}
+# Platforms that need login cookies — twitter also needs them for video
+LOGIN_REQUIRED = {'instagram', 'facebook', 'reddit', 'twitter'}
 
 PLATFORM_ICONS = {
     'youtube':     '\U0001f534',
@@ -139,7 +148,7 @@ def get_videos(url, extra_params):
         'skip_unavailable_fragments': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['web', 'tv_embedded', 'android', 'ios'],
+                'player_client': ['web', 'mweb', 'tv_embedded', 'android', 'ios'],
                 'skip': ['translated_subs'],
             }
         },
@@ -299,7 +308,6 @@ def version():
 @route_api('cookies/status')
 @set_access_control
 def cookies_status():
-    """Check which platform cookies are configured."""
     all_vars = [
         'YOUTUBE_COOKIES', 'INSTAGRAM_COOKIES', 'FACEBOOK_COOKIES',
         'REDDIT_COOKIES', 'TWITTER_COOKIES', 'TIKTOK_COOKIES',
@@ -327,7 +335,7 @@ def _run_test(platform, url):
             'skip_unavailable_fragments': True,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['web', 'tv_embedded', 'android', 'ios'],
+                    'player_client': ['web', 'mweb', 'tv_embedded', 'android', 'ios'],
                     'skip': ['translated_subs'],
                 }
             },
@@ -356,7 +364,6 @@ def _run_test(platform, url):
             })
 
         elapsed = round(time.time() - t0, 2)
-        cookies_path_used = _get_cookies_for_url(url)
         return {
             'status':            'ok',
             'url':               url,
@@ -368,7 +375,7 @@ def _run_test(platform, url):
             'formats_available': len(formats),
             'formats':           fmt_list,
             'direct_url':        direct_url,
-            'cookies_used':      bool(cookies_path_used),
+            'cookies_used':      bool(cookies_path),
             'login_required':    platform in LOGIN_REQUIRED,
             'elapsed_sec':       elapsed,
         }
@@ -409,7 +416,6 @@ def _build_html(results, summary, platform_filter):
     total  = summary['total']
     score_color = '#22c55e' if passed == total else ('#f59e0b' if passed >= total // 2 else '#ef4444')
 
-    # Cookie status bar
     cookie_vars = ['YOUTUBE_COOKIES','INSTAGRAM_COOKIES','FACEBOOK_COOKIES','REDDIT_COOKIES','TWITTER_COOKIES','TIKTOK_COOKIES']
     cookie_pills = ''
     for var in cookie_vars:
@@ -499,7 +505,7 @@ def _build_html(results, summary, platform_filter):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>yt-dlp API — Platform Test Dashboard</title>
+<title>yt-dlp API \u2014 Platform Test Dashboard</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:24px}}
@@ -599,7 +605,7 @@ def test_all_platforms():
     /api/test?platform=youtube&format=html -> single platform HTML
     """
     platform_filter = request.args.get('platform', None)
-    response_format = request.args.get('format', 'json')  # JSON is now the default
+    response_format = request.args.get('format', 'json')
 
     urls_to_test = {
         k: v for k, v in TEST_URLS.items()
@@ -627,7 +633,6 @@ def test_all_platforms():
         resp.headers['Content-Type'] = 'text/html; charset=utf-8'
         return resp
 
-    # Default: JSON
     return jsonify({'summary': summary, 'results': results})
 
 
