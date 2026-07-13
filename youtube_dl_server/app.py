@@ -1,6 +1,7 @@
 import functools
 import logging
 import os
+import tempfile
 import traceback
 import sys
 
@@ -16,7 +17,28 @@ if not hasattr(sys.stderr, 'isatty'):
     sys.stderr.isatty = lambda: False
 
 
-COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
+# --- Cookie resolution: env var > repo file > none ---
+# On Heroku set config var: YOUTUBE_COOKIES with the full Netscape cookie file contents
+_COOKIES_ENV = os.environ.get('YOUTUBE_COOKIES', '')
+_COOKIES_REPO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
+
+
+def _get_cookies_file():
+    """Return a valid path to a cookies.txt, or None.
+    If YOUTUBE_COOKIES env var is set, write it to a temp file and use that.
+    Otherwise fall back to the repo cookies.txt file.
+    """
+    if _COOKIES_ENV:
+        tmp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.txt', prefix='yt_cookies_', delete=False
+        )
+        tmp.write(_COOKIES_ENV)
+        tmp.flush()
+        tmp.close()
+        return tmp.name
+    if os.path.isfile(_COOKIES_REPO_FILE):
+        return _COOKIES_REPO_FILE
+    return None
 
 
 class SimpleYDL(yt_dlp.YoutubeDL):
@@ -34,9 +56,9 @@ def get_videos(url, extra_params):
         'cachedir': False,
         'logger': current_app.logger.getChild('youtube-dl'),
     }
-    # Inject cookies file if it exists to bypass YouTube bot detection
-    if os.path.isfile(COOKIES_FILE):
-        ydl_params['cookiefile'] = COOKIES_FILE
+    cookies_path = _get_cookies_file()
+    if cookies_path:
+        ydl_params['cookiefile'] = cookies_path
 
     ydl_params.update(extra_params)
     ydl = SimpleYDL(ydl_params)
