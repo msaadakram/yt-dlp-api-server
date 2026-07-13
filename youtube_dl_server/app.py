@@ -6,6 +6,7 @@ import tempfile
 import traceback
 import sys
 import time
+import threading
 
 from flask import Flask, Blueprint, current_app, jsonify, request, redirect, abort, make_response, Response, stream_with_context
 import yt_dlp
@@ -15,8 +16,10 @@ from .version import __version__
 
 try:
     import urllib.request as urllib_req
+    from urllib.parse import quote as urlquote
 except ImportError:
     import urllib2 as urllib_req
+    from urllib import quote as urlquote
 
 
 if not hasattr(sys.stderr, 'isatty'):
@@ -87,7 +90,7 @@ DEFAULT_FORMAT = (
 )
 
 # ---------------------------------------------------------------
-# Quality buckets for structured download links
+# Quality buckets
 # ---------------------------------------------------------------
 VIDEO_HEIGHT_BUCKETS = [
     (144,  '144p'),
@@ -115,7 +118,6 @@ PREFERRED_AUDIO_EXTS = ['mp3', 'm4a', 'aac', 'ogg', 'opus', 'webm', 'wav']
 
 
 def _bucket_height(h):
-    """Return human label for a pixel height."""
     if not h:
         return 'unknown'
     for threshold, label in reversed(VIDEO_HEIGHT_BUCKETS):
@@ -125,7 +127,6 @@ def _bucket_height(h):
 
 
 def _bucket_bitrate(tbr):
-    """Return human label for a bitrate (kbps)."""
     if not tbr:
         return 'unknown'
     for threshold, label in reversed(AUDIO_BITRATE_BUCKETS):
@@ -135,7 +136,6 @@ def _bucket_bitrate(tbr):
 
 
 def _safe_filename(title):
-    """Sanitise a video title for use as a filename."""
     name = re.sub(r'[\\/:*?"<>|]', '_', title or 'video')
     return name[:80].strip()
 
@@ -164,10 +164,17 @@ def _fmt_dur(s):
         return str(s)
 
 
-# ---------------------------------------------------------------
-# Core yt-dlp extraction
-# ---------------------------------------------------------------
+def _is_manifest_url(url):
+    """Return True if URL is an HLS/DASH manifest (not a real video file)."""
+    if not url:
+        return False
+    u = url.lower().split('?')[0]
+    return u.endswith('.m3u8') or u.endswith('.mpd') or 'manifest' in u
 
+
+# ---------------------------------------------------------------
+# TEST_URLS / constants
+# ---------------------------------------------------------------
 TEST_URLS = {
     'youtube':     'https://www.youtube.com/watch?v=BaW_jenozKc',
     'tiktok':      'https://www.tiktok.com/@khaby.lame/video/7646812028874673439',
@@ -247,23 +254,30 @@ def flatten_result(result):
 
 
 # ---------------------------------------------------------------
-# /api/fetch — main download-links endpoint
+# /api/fetch — build structured download links
 # ---------------------------------------------------------------
 
 def _build_download_links(info, base_url):
     """
-    Build structured video + audio download link lists from yt-dlp info dict.
-    base_url: Flask request base (e.g. https://myserver.com) for proxy links.
+    Build video + audio download link lists from yt-dlp info dict.
+
+    KEY FIX: YouTube (and some others) use adaptive streaming — video and audio
+    are SEPARATE streams. A video-only URL proxied directly gives you a file
+    with no audio. We flag these formats with:
+        needs_merge: true   — video-only, use /api/download (yt-dlp merges)
+        is_manifest: true   — HLS/DASH manifest, MUST use /api/download
+
+    /api/download uses yt-dlp's own downloader with a specific format_id,
+    downloads to a server temp file, then streams it back — giving the user
+    a complete merged MP4 with both video and audio.
     """
     formats = info.get('formats') or []
     title   = info.get('title', 'video')
     safe_fn = _safe_filename(title)
+    page_url = info.get('webpage_url') or info.get('url') or ''
 
     seen_video_heights = {}
     seen_audio_keys   = {}
-
-    video_links = []
-    audio_links = []
 
     for f in formats:
         furl   = f.get('url', '')
@@ -276,45 +290,74 @@ def _build_download_links(info, base_url):
         abr    = f.get('abr') or tbr
         fsize  = f.get('filesize') or f.get('filesize_approx')
         fmt_id = f.get('format_id', '')
+        protocol = f.get('protocol', '') or ''
 
         if not furl:
             continue
 
-        # --- VIDEO formats (has video stream) ---
-        if vcodec != 'none' and height:
+        has_audio   = acodec != 'none'
+        has_video   = vcodec != 'none'
+        is_manifest = _is_manifest_url(furl) or protocol in ('m3u8', 'm3u8_native', 'dash')
+        needs_merge = has_video and not has_audio  # video-only stream
+
+        # Use /api/download for: manifest URLs OR video-only streams
+        # Use /api/proxy only for: direct complete MP4/WebM with both streams
+        use_server_download = is_manifest or needs_merge
+
+        dl_url = '{}api/download?url={}&format_id={}&filename={}.{}'.format(
+            base_url,
+            urlquote(page_url, safe=''),
+            urlquote(fmt_id, safe=''),
+            urlquote(safe_fn, safe=''),
+            ext
+        )
+        proxy_url = '{}api/proxy?url={}&filename={}.{}'.format(
+            base_url,
+            urlquote(furl, safe=''),
+            urlquote(safe_fn, safe=''),
+            ext
+        )
+        # recommended_url: always works (download for adaptive, proxy for direct)
+        recommended_url = dl_url if use_server_download else proxy_url
+
+        # --- VIDEO formats ---
+        if has_video and height:
             bucket = _bucket_height(height)
-            # prefer mp4 over other exts per bucket
             existing = seen_video_heights.get(bucket)
             prefer_this = (
                 existing is None or
-                (ext == 'mp4' and existing['ext'] != 'mp4') or
-                (ext == existing['ext'] and (fsize or 0) > (existing.get('filesize_bytes') or 0))
+                # prefer formats that have audio over video-only
+                (has_audio and not existing['has_audio']) or
+                # prefer mp4 among same audio-availability
+                (has_audio == existing['has_audio'] and ext == 'mp4' and existing['ext'] != 'mp4') or
+                # prefer larger filesize
+                (has_audio == existing['has_audio'] and ext == existing['ext'] and
+                 (fsize or 0) > (existing.get('filesize_bytes') or 0))
             )
             if prefer_this:
-                entry = {
-                    'quality':        bucket,
-                    'height':         height,
-                    'width':          width,
-                    'ext':            ext,
-                    'vcodec':         vcodec,
-                    'acodec':         acodec,
-                    'has_audio':      acodec != 'none',
-                    'tbr_kbps':       round(tbr) if tbr else None,
-                    'filesize':       _fmt_bytes(fsize),
-                    'filesize_bytes': fsize,
-                    'format_id':      fmt_id,
-                    'direct_url':     furl,
-                    'proxy_url':      '{}api/proxy?url={}&filename={}.{}'.format(
-                                          base_url,
-                                          urllib_req.quote(furl, safe=''),
-                                          urllib_req.quote(safe_fn, safe=''),
-                                          ext
-                                      ),
+                seen_video_heights[bucket] = {
+                    'quality':          bucket,
+                    'height':           height,
+                    'width':            width,
+                    'ext':              ext,
+                    'vcodec':           vcodec,
+                    'acodec':           acodec,
+                    'has_audio':        has_audio,
+                    'needs_merge':      needs_merge,
+                    'is_manifest':      is_manifest,
+                    'tbr_kbps':         round(tbr) if tbr else None,
+                    'filesize':         _fmt_bytes(fsize),
+                    'filesize_bytes':   fsize,
+                    'format_id':        fmt_id,
+                    'direct_url':       furl,         # raw CDN (may be video-only or manifest)
+                    'proxy_url':        proxy_url,    # server proxy of raw URL
+                    'download_url':     dl_url,       # yt-dlp downloads & merges (RECOMMENDED for YouTube)
+                    'recommended_url':  recommended_url,
+                    'note': 'Use download_url for YouTube — direct_url has no audio' if needs_merge else '',
                 }
-                seen_video_heights[bucket] = entry
 
         # --- AUDIO-only formats ---
-        elif vcodec == 'none' and acodec != 'none':
+        elif not has_video and has_audio:
             bucket = _bucket_bitrate(abr)
             key    = '{}_{}'.format(ext, bucket)
             existing = seen_audio_keys.get(key)
@@ -323,60 +366,62 @@ def _build_download_links(info, base_url):
                 (fsize or 0) > (existing.get('filesize_bytes') or 0)
             )
             if prefer_this:
-                entry = {
-                    'quality':        bucket,
-                    'ext':            ext,
-                    'acodec':         acodec,
-                    'abr_kbps':       round(abr) if abr else None,
-                    'filesize':       _fmt_bytes(fsize),
-                    'filesize_bytes': fsize,
-                    'format_id':      fmt_id,
-                    'direct_url':     furl,
-                    'proxy_url':      '{}api/proxy?url={}&filename={}.{}'.format(
-                                          base_url,
-                                          urllib_req.quote(furl, safe=''),
-                                          urllib_req.quote(safe_fn, safe=''),
-                                          ext
-                                      ),
+                seen_audio_keys[key] = {
+                    'quality':         bucket,
+                    'ext':             ext,
+                    'acodec':          acodec,
+                    'abr_kbps':        round(abr) if abr else None,
+                    'filesize':        _fmt_bytes(fsize),
+                    'filesize_bytes':  fsize,
+                    'format_id':       fmt_id,
+                    'direct_url':      furl,
+                    'proxy_url':       proxy_url,
+                    'download_url':    dl_url,
+                    'recommended_url': dl_url if is_manifest else proxy_url,
+                    'is_manifest':     is_manifest,
                 }
-                seen_audio_keys[key] = entry
 
-    # Sort by height desc for video, bitrate desc for audio
-    for bucket_label in ['4K','1440p','1080p','720p','480p','360p','240p','144p']:
+    # Sort video by height desc
+    video_links = []
+    for bucket_label in ['4K', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p']:
         if bucket_label in seen_video_heights:
             video_links.append(seen_video_heights[bucket_label])
 
-    # sort audio by ext preference then bitrate desc
-    audio_sorted = sorted(
+    # Sort audio: preferred ext first, then bitrate desc
+    audio_links = sorted(
         seen_audio_keys.values(),
         key=lambda x: (
             PREFERRED_AUDIO_EXTS.index(x['ext']) if x['ext'] in PREFERRED_AUDIO_EXTS else 99,
             -(x['abr_kbps'] or 0)
         )
     )
-    audio_links = audio_sorted
 
-    # Best picks
     best_video = video_links[0] if video_links else None
     best_audio = next(
-        (a for a in audio_links if a['ext'] in ('mp3','m4a')),
+        (a for a in audio_links if a['ext'] in ('mp3', 'm4a')),
         audio_links[0] if audio_links else None
     )
 
-    # If platform returns a single merged stream (no separate formats)
-    fallback_url = info.get('url') or info.get('webpage_url')
-    if not video_links and not audio_links and fallback_url:
+    # Fallback: single merged stream (TikTok, Vimeo, etc.)
+    fallback_url = info.get('url') or page_url
+    if not video_links and not audio_links and fallback_url and not _is_manifest_url(fallback_url):
         ext = info.get('ext', 'mp4') or 'mp4'
         fallback_entry = {
-            'quality':    'best',
-            'ext':        ext,
-            'direct_url': fallback_url,
-            'proxy_url':  '{}api/proxy?url={}&filename={}.{}'.format(
-                              base_url,
-                              urllib_req.quote(fallback_url, safe=''),
-                              urllib_req.quote(safe_fn, safe=''),
-                              ext
-                          ),
+            'quality':         'best',
+            'ext':             ext,
+            'has_audio':       True,
+            'needs_merge':     False,
+            'is_manifest':     False,
+            'direct_url':      fallback_url,
+            'proxy_url':       '{}api/proxy?url={}&filename={}.{}'.format(
+                                   base_url, urlquote(fallback_url, safe=''),
+                                   urlquote(safe_fn, safe=''), ext),
+            'download_url':    '{}api/download?url={}&format_id=best&filename={}.{}'.format(
+                                   base_url, urlquote(page_url, safe=''),
+                                   urlquote(safe_fn, safe=''), ext),
+            'recommended_url': '{}api/proxy?url={}&filename={}.{}'.format(
+                                   base_url, urlquote(fallback_url, safe=''),
+                                   urlquote(safe_fn, safe=''), ext),
         }
         video_links.append(fallback_entry)
         best_video = fallback_entry
@@ -415,7 +460,7 @@ def handle_youtube_dl_error(error):
 
 class WrongParameterTypeError(ValueError):
     def __init__(self, value, type, parameter):
-        message = '"{}" expects a {}, got "{}"'.format(parameter, type, value)
+        message = '"{}\" expects a {}, got \"{}\"'.format(parameter, type, value)
         super(WrongParameterTypeError, self).__init__(message)
 
 
@@ -478,7 +523,7 @@ def get_result():
 
 
 # ================================================================
-#  /api/fetch  — THE MAIN ENDPOINT
+#  /api/fetch
 # ================================================================
 @route_api('fetch')
 @set_access_control
@@ -486,29 +531,28 @@ def fetch():
     """
     GET /api/fetch?url=<VIDEO_URL>
 
-    Returns JSON with:
-      - metadata: title, uploader, duration, thumbnail, views, description
-      - video_links: array of {quality, ext, direct_url, proxy_url, filesize, ...}
-                     sorted 4K -> 1080p -> 720p -> 480p -> 360p -> 240p -> 144p
-      - audio_links: array of {ext, quality, direct_url, proxy_url, ...}
-                     mp3/m4a preferred, sorted by bitrate desc
-      - best_video: single best video link object
-      - best_audio: single best audio link (mp3 or m4a preferred)
+    Returns structured JSON with metadata, video_links, audio_links,
+    best_video, best_audio.
 
-    Optional params:
-      ?qualities=720p,1080p   filter video_links to these qualities only
-      ?audio_only=true        return only audio_links
-      ?video_only=true        return only video_links
-      ?ext=mp4                filter by extension
+    IMPORTANT — recommended_url field:
+      For YouTube / adaptive streams: use recommended_url (points to /api/download)
+      For TikTok / Vimeo / direct MP4s: use recommended_url (points to /api/proxy)
+      Check needs_merge: true -> must use download_url, not direct_url
+
+    Optional filters:
+      ?qualities=720p,1080p
+      ?audio_only=true
+      ?video_only=true
+      ?ext=mp4
     """
     url = request.args.get('url')
     if not url:
         return jsonify({'error': 'Missing required parameter: url'}), 400
 
-    qualities_filter = request.args.get('qualities')  # e.g. "720p,1080p"
-    audio_only  = query_bool(request.args.get('audio_only'), 'audio_only', False)
-    video_only  = query_bool(request.args.get('video_only'), 'video_only', False)
-    ext_filter  = request.args.get('ext')  # e.g. "mp4"
+    qualities_filter = request.args.get('qualities')
+    audio_only = query_bool(request.args.get('audio_only'), 'audio_only', False)
+    video_only = query_bool(request.args.get('video_only'), 'video_only', False)
+    ext_filter = request.args.get('ext')
 
     t0 = time.time()
     try:
@@ -523,12 +567,9 @@ def fetch():
             'elapsed': round(time.time() - t0, 2),
         }), 500
 
-    # Base URL for proxy links (e.g. "https://myserver.com/")
     base_url = request.host_url
-
     video_links, audio_links, best_video, best_audio = _build_download_links(info, base_url)
 
-    # Apply optional filters
     if qualities_filter:
         wanted = [q.strip() for q in qualities_filter.split(',')]
         video_links = [v for v in video_links if v['quality'] in wanted]
@@ -540,7 +581,6 @@ def fetch():
     if video_only:
         audio_links = []
 
-    # Collect all thumbnails (some platforms have multiple)
     thumbnails = []
     for t in (info.get('thumbnails') or []):
         if t.get('url'):
@@ -552,64 +592,210 @@ def fetch():
             })
     best_thumbnail = info.get('thumbnail') or (thumbnails[-1]['url'] if thumbnails else None)
 
-    result = {
+    return jsonify({
         'status':   'ok',
         'url':      url,
         'elapsed':  round(time.time() - t0, 2),
         'metadata': {
-            'title':       info.get('title'),
-            'uploader':    info.get('uploader') or info.get('channel'),
-            'uploader_url':info.get('uploader_url') or info.get('channel_url'),
-            'duration_sec':info.get('duration'),
-            'duration':    _fmt_dur(info.get('duration')),
-            'view_count':  info.get('view_count'),
-            'like_count':  info.get('like_count'),
-            'upload_date': info.get('upload_date'),
-            'description': (info.get('description') or '')[:500],
-            'platform':    info.get('extractor_key', '').lower(),
-            'webpage_url': info.get('webpage_url'),
-            'thumbnail':   best_thumbnail,
-            'thumbnails':  thumbnails,
+            'title':        info.get('title'),
+            'uploader':     info.get('uploader') or info.get('channel'),
+            'uploader_url': info.get('uploader_url') or info.get('channel_url'),
+            'duration_sec': info.get('duration'),
+            'duration':     _fmt_dur(info.get('duration')),
+            'view_count':   info.get('view_count'),
+            'like_count':   info.get('like_count'),
+            'upload_date':  info.get('upload_date'),
+            'description':  (info.get('description') or '')[:500],
+            'platform':     info.get('extractor_key', '').lower(),
+            'webpage_url':  info.get('webpage_url'),
+            'thumbnail':    best_thumbnail,
+            'thumbnails':   thumbnails,
         },
-        'video_links': video_links,
-        'audio_links': audio_links,
-        'best_video':  best_video,
-        'best_audio':  best_audio,
-        'total_video_formats': len(video_links),
-        'total_audio_formats': len(audio_links),
-    }
-    return jsonify(result)
+        'video_links':          video_links,
+        'audio_links':          audio_links,
+        'best_video':           best_video,
+        'best_audio':           best_audio,
+        'total_video_formats':  len(video_links),
+        'total_audio_formats':  len(audio_links),
+        'adaptive_streaming':   any(v.get('needs_merge') for v in video_links),
+        'tip': (
+            'YouTube uses adaptive streaming. Use recommended_url or download_url '
+            'for each format — it calls /api/download which merges video+audio. '
+            'DO NOT use direct_url for YouTube video_links — it has no audio.'
+        ) if any(v.get('needs_merge') for v in video_links) else None,
+    })
 
 
 # ================================================================
-#  /api/proxy  — stream CDN URL through server as download
+#  /api/download — yt-dlp downloads & merges to temp file, streams back
+#
+#  This is the CORRECT way to download YouTube videos.
+#  yt-dlp handles: downloading video+audio separately, merging into
+#  a single MP4 (using its built-in merger, no FFmpeg needed for remux),
+#  then we stream the temp file back to the user.
+# ================================================================
+@route_api('download')
+def download_video():
+    """
+    GET /api/download?url=<PAGE_URL>&format_id=<FMT_ID>&filename=video.mp4
+
+    Uses yt-dlp to download the specified format (or best) to a server
+    temp file, then streams it as a file download.
+
+    This correctly handles:
+    - YouTube adaptive streams (video-only + audio-only merged by yt-dlp)
+    - HLS/DASH manifests
+    - Any other platform
+
+    format_id: the format_id from /api/fetch video_links (e.g. "137+140")
+                or "best", "bestvideo+bestaudio", etc.
+                If omitted, downloads best available quality.
+    """
+    page_url  = request.args.get('url')
+    fmt_id    = request.args.get('format_id', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best')
+    filename  = request.args.get('filename', 'video.mp4')
+
+    if not page_url:
+        return jsonify({'error': 'Missing required parameter: url'}), 400
+
+    filename = re.sub(r'[^\w\-\.]+', '_', filename)[:120]
+    if not filename.endswith(('.mp4', '.webm', '.mkv', '.m4a', '.mp3', '.ogg', '.opus')):
+        filename += '.mp4'
+
+    # Create a temp directory for this download
+    tmp_dir  = tempfile.mkdtemp(prefix='ytdlp_dl_')
+    out_tmpl = os.path.join(tmp_dir, '%(title)s.%(ext)s')
+
+    ydl_params = {
+        'format':   fmt_id,
+        'outtmpl':  out_tmpl,
+        'cachedir': False,
+        'quiet':    True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'extractor_retries': 3,
+        # Use yt-dlp's built-in merger (copies streams into MKV/MP4 container,
+        # no re-encoding, works without FFmpeg for same-container streams)
+        'merge_output_format': 'mp4',
+        'postprocessors': [],
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'mweb', 'tv_embedded', 'android', 'ios'],
+                'skip': ['translated_subs'],
+            }
+        },
+    }
+    cookies_path = _get_cookies_for_url(page_url)
+    if cookies_path:
+        ydl_params['cookiefile'] = cookies_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_params) as ydl:
+            info = ydl.extract_info(page_url, download=True)
+    except Exception as e:
+        # Cleanup temp dir
+        _cleanup_dir(tmp_dir)
+        return jsonify({'error': 'Download failed: {}'.format(str(e))}), 500
+
+    # Find the downloaded file
+    downloaded_file = None
+    for fname in os.listdir(tmp_dir):
+        fpath = os.path.join(tmp_dir, fname)
+        if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+            downloaded_file = fpath
+            break
+
+    if not downloaded_file:
+        _cleanup_dir(tmp_dir)
+        return jsonify({'error': 'Download succeeded but output file not found'}), 500
+
+    file_ext     = os.path.splitext(downloaded_file)[1] or '.mp4'
+    file_size    = os.path.getsize(downloaded_file)
+    content_type = _ext_to_mime(file_ext)
+
+    # Override filename extension to match what was actually produced
+    base_name = os.path.splitext(filename)[0]
+    send_name = base_name + file_ext
+
+    def stream_file_and_cleanup(path, dirpath):
+        try:
+            with open(path, 'rb') as fh:
+                while True:
+                    chunk = fh.read(4 * 1024 * 1024)  # 4 MB chunks
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            _cleanup_dir(dirpath)
+
+    headers = {
+        'Content-Disposition': 'attachment; filename="{}"'.format(send_name),
+        'Content-Type':        content_type,
+        'Content-Length':      str(file_size),
+        'Access-Control-Allow-Origin': '*',
+    }
+
+    return Response(
+        stream_with_context(stream_file_and_cleanup(downloaded_file, tmp_dir)),
+        headers=headers,
+        status=200,
+    )
+
+
+def _cleanup_dir(dirpath):
+    """Delete a directory and all its contents silently."""
+    try:
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _ext_to_mime(ext):
+    mapping = {
+        '.mp4':  'video/mp4',
+        '.webm': 'video/webm',
+        '.mkv':  'video/x-matroska',
+        '.mov':  'video/quicktime',
+        '.avi':  'video/x-msvideo',
+        '.mp3':  'audio/mpeg',
+        '.m4a':  'audio/mp4',
+        '.ogg':  'audio/ogg',
+        '.opus': 'audio/opus',
+        '.wav':  'audio/wav',
+        '.aac':  'audio/aac',
+    }
+    return mapping.get(ext.lower(), 'application/octet-stream')
+
+
+# ================================================================
+#  /api/proxy — stream direct CDN URL through server (non-YouTube)
 # ================================================================
 @route_api('proxy')
 def proxy_download():
     """
     GET /api/proxy?url=<DIRECT_CDN_URL>&filename=video.mp4
 
-    Streams the CDN URL through the server with Content-Disposition: attachment.
-    Use this when direct CDN links expire or block hotlinking.
+    Proxies a direct CDN URL through the server as a download.
+    Use ONLY for direct MP4/WebM links (TikTok, Vimeo, Dailymotion etc.)
+    DO NOT use for YouTube — use /api/download instead.
     """
     cdn_url  = request.args.get('url')
     filename = request.args.get('filename', 'video.mp4')
     if not cdn_url:
         return jsonify({'error': 'Missing url parameter'}), 400
 
-    # Sanitise filename
     filename = re.sub(r'[^\w\-\.]+', '_', filename)[:120]
 
-    import urllib.request as ur
-    req = ur.Request(cdn_url, headers={
+    req = urllib_req.Request(cdn_url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                       'AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/124.0.0.0 Safari/537.36',
-        'Referer':    cdn_url.split('?')[0],
+        'Referer': cdn_url.split('?')[0],
     })
 
     try:
-        remote = ur.urlopen(req, timeout=30)
+        remote = urllib_req.urlopen(req, timeout=30)
     except Exception as e:
         return jsonify({'error': 'Failed to open stream: {}'.format(str(e))}), 502
 
@@ -619,7 +805,7 @@ def proxy_download():
     def generate():
         try:
             while True:
-                chunk = remote.read(512 * 1024)  # 512 KB chunks
+                chunk = remote.read(512 * 1024)
                 if not chunk:
                     break
                 yield chunk
@@ -634,31 +820,24 @@ def proxy_download():
     if content_length:
         headers['Content-Length'] = content_length
 
-    return Response(
-        stream_with_context(generate()),
-        headers=headers,
-        status=200,
-    )
+    return Response(stream_with_context(generate()), headers=headers, status=200)
 
 
 # ================================================================
-#  /api/stream  — inline browser streaming (no download dialog)
+#  /api/stream — inline browser streaming
 # ================================================================
 @route_api('stream')
 def stream_video():
     """
     GET /api/stream?url=<DIRECT_CDN_URL>
-
-    Streams video inline (for <video> src or browser preview).
-    Supports Range header for seek support.
+    Inline stream for <video> element. Supports Range header for seeking.
     """
     cdn_url = request.args.get('url')
     if not cdn_url:
         return jsonify({'error': 'Missing url parameter'}), 400
 
-    import urllib.request as ur
     range_header = request.headers.get('Range', '')
-    req_headers = {
+    req_headers  = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                       'AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/124.0.0.0 Safari/537.36',
@@ -667,9 +846,9 @@ def stream_video():
     if range_header:
         req_headers['Range'] = range_header
 
-    req = ur.Request(cdn_url, headers=req_headers)
+    req = urllib_req.Request(cdn_url, headers=req_headers)
     try:
-        remote = ur.urlopen(req, timeout=30)
+        remote = urllib_req.urlopen(req, timeout=30)
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
@@ -688,34 +867,29 @@ def stream_video():
             remote.close()
 
     headers = {
-        'Content-Type':              content_type,
-        'Accept-Ranges':             'bytes',
+        'Content-Type':                content_type,
+        'Accept-Ranges':               'bytes',
         'Access-Control-Allow-Origin': '*',
     }
     if content_length:
         headers['Content-Length'] = content_length
 
-    return Response(
-        stream_with_context(generate()),
-        headers=headers,
-        status=status_code,
-    )
+    return Response(stream_with_context(generate()), headers=headers, status=status_code)
 
 
 # ================================================================
-#  Legacy / existing endpoints (unchanged)
+#  Legacy endpoints
 # ================================================================
 @route_api('info')
 @set_access_control
 def info():
-    url = request.args['url']
+    url    = request.args['url']
     result = get_result()
-    key = 'info'
+    key    = 'info'
     if query_bool(request.args.get('flatten'), 'flatten', False):
         result = flatten_result(result)
-        key = 'videos'
-    result = {'url': url, key: result}
-    return jsonify(result)
+        key    = 'videos'
+    return jsonify({'url': url, key: result})
 
 
 @route_api('play')
@@ -727,21 +901,14 @@ def play():
 @route_api('extractors')
 @set_access_control
 def list_extractors():
-    ie_list = [{
-        'name': ie.IE_NAME,
-        'working': ie.working(),
-    } for ie in yt_dlp.gen_extractors()]
+    ie_list = [{'name': ie.IE_NAME, 'working': ie.working()} for ie in yt_dlp.gen_extractors()]
     return jsonify(extractors=ie_list)
 
 
 @route_api('version')
 @set_access_control
 def version():
-    result = {
-        'yt-dlp': yt_dlp_version,
-        'yt-dlp-api-server': __version__,
-    }
-    return jsonify(result)
+    return jsonify({'yt-dlp': yt_dlp_version, 'yt-dlp-api-server': __version__})
 
 
 @route_api('cookies/status')
@@ -754,29 +921,24 @@ def cookies_status():
     status = {}
     for var in all_vars:
         val = os.environ.get(var, '')
-        status[var] = {
-            'configured': bool(val),
-            'length': len(val) if val else 0,
-        }
+        status[var] = {'configured': bool(val), 'length': len(val) if val else 0}
     return jsonify({'cookies': status})
 
 
 # ================================================================
-#  Test dashboard (unchanged)
+#  Test dashboard
 # ================================================================
 def _run_test(platform, url):
     t0 = time.time()
     try:
         ydl_params = _base_ydl_params(url)
         ydl_params['extractor_retries'] = 2
-
         with yt_dlp.YoutubeDL(ydl_params) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        formats = info.get('formats', [])
+        formats    = info.get('formats', [])
         direct_url = (formats[-1].get('url') if formats else None) or info.get('url')
-
-        fmt_list = []
+        fmt_list   = []
         for f in formats:
             fmt_list.append({
                 'id':         f.get('format_id', ''),
@@ -788,50 +950,42 @@ def _run_test(platform, url):
                 'tbr':        f.get('tbr'),
                 'url':        f.get('url', ''),
             })
-
-        elapsed = round(time.time() - t0, 2)
         return {
-            'status':            'ok',
-            'url':               url,
-            'title':             info.get('title', 'N/A'),
-            'uploader':          info.get('uploader', 'N/A'),
-            'duration':          info.get('duration', 'N/A'),
-            'view_count':        info.get('view_count'),
-            'thumbnail':         info.get('thumbnail'),
+            'status': 'ok', 'url': url,
+            'title': info.get('title', 'N/A'),
+            'uploader': info.get('uploader', 'N/A'),
+            'duration': info.get('duration', 'N/A'),
+            'view_count': info.get('view_count'),
+            'thumbnail': info.get('thumbnail'),
             'formats_available': len(formats),
-            'formats':           fmt_list,
-            'direct_url':        direct_url,
-            'cookies_used':      bool(_get_cookies_for_url(url)),
-            'login_required':    platform in LOGIN_REQUIRED,
-            'elapsed_sec':       elapsed,
+            'formats': fmt_list,
+            'direct_url': direct_url,
+            'cookies_used': bool(_get_cookies_for_url(url)),
+            'login_required': platform in LOGIN_REQUIRED,
+            'elapsed_sec': round(time.time() - t0, 2),
         }
     except Exception as e:
-        elapsed = round(time.time() - t0, 2)
         return {
-            'status':         'error',
-            'url':            url,
-            'error':          str(e),
-            'cookies_used':   bool(_get_cookies_for_url(url)),
+            'status': 'error', 'url': url, 'error': str(e),
+            'cookies_used': bool(_get_cookies_for_url(url)),
             'login_required': platform in LOGIN_REQUIRED,
-            'elapsed_sec':    elapsed,
+            'elapsed_sec': round(time.time() - t0, 2),
         }
 
 
 def _build_html(results, summary, platform_filter):
-    passed = summary['passed']
-    total  = summary['total']
+    passed      = summary['passed']
+    total       = summary['total']
     score_color = '#22c55e' if passed == total else ('#f59e0b' if passed >= total // 2 else '#ef4444')
 
-    cookie_vars = ['YOUTUBE_COOKIES','INSTAGRAM_COOKIES','FACEBOOK_COOKIES','REDDIT_COOKIES','TWITTER_COOKIES','TIKTOK_COOKIES']
+    cookie_vars  = ['YOUTUBE_COOKIES','INSTAGRAM_COOKIES','FACEBOOK_COOKIES','REDDIT_COOKIES','TWITTER_COOKIES','TIKTOK_COOKIES']
     cookie_pills = ''
     for var in cookie_vars:
         configured = bool(os.environ.get(var, ''))
         label = var.replace('_COOKIES','')
         cookie_pills += '<span class="cpill {}">{} {}</span>'.format(
             'cpill-ok' if configured else 'cpill-no',
-            '\u2714' if configured else '\u2717',
-            label
-        )
+            '\u2714' if configured else '\u2717', label)
 
     cards = ''
     for platform, r in sorted(results.items()):
@@ -845,12 +999,12 @@ def _build_html(results, summary, platform_filter):
             '<span class="badge err">&#10007; ERROR</span>'
         )
         cookie_badge = '<span class="badge cookie">&#127850; cookies</span>' if cookies_used else ''
-
-        thumb_html = ''
+        thumb_html   = ''
         if is_ok and r.get('thumbnail'):
             thumb_html = '<img src="{}" class="thumb" alt="thumbnail">'.format(r['thumbnail'])
 
         meta_rows = ''
+        fmt_table = ''
         if is_ok:
             meta_rows += '<tr><td>Title</td><td class="val">{}</td></tr>'.format(r.get('title','N/A'))
             meta_rows += '<tr><td>Uploader</td><td class="val">{}</td></tr>'.format(r.get('uploader','N/A'))
@@ -862,22 +1016,19 @@ def _build_html(results, summary, platform_filter):
             if r.get('direct_url'):
                 meta_rows += '<tr><td>Direct URL</td><td class="val url-cell"><a href="{}" target="_blank">Open stream &#8599;</a></td></tr>'.format(r['direct_url'])
             fmts = r.get('formats', [])
-            fmt_table = ''
             if fmts:
-                fmt_table = '<details><summary>Show all {} formats</summary><table class="fmt-table"><thead><tr><th>ID</th><th>Ext</th><th>Resolution</th><th>VCodec</th><th>ACodec</th><th>Bitrate</th><th>Size</th></tr></thead><tbody>'.format(len(fmts))
+                fmt_table  = '<details><summary>Show all {} formats</summary>'.format(len(fmts))
+                fmt_table += '<table class="fmt-table"><thead><tr><th>ID</th><th>Ext</th><th>Resolution</th><th>VCodec</th><th>ACodec</th><th>Bitrate</th><th>Size</th></tr></thead><tbody>'
                 for f in fmts:
                     fmt_table += '<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
                         f.get('id',''), f.get('ext',''), f.get('resolution',''),
                         f.get('vcodec',''), f.get('acodec',''),
                         '{} kbps'.format(round(f['tbr'])) if f.get('tbr') else 'N/A',
-                        _fmt_bytes(f.get('filesize'))
-                    )
+                        _fmt_bytes(f.get('filesize')))
                 fmt_table += '</tbody></table></details>'
         else:
-            err_msg = r.get('error', 'Unknown error')
-            meta_rows += '<tr><td>Error</td><td class="val err-msg">{}</td></tr>'.format(err_msg)
+            meta_rows += '<tr><td>Error</td><td class="val err-msg">{}</td></tr>'.format(r.get('error','Unknown error'))
             meta_rows += '<tr><td>Elapsed</td><td class="val">{} s</td></tr>'.format(r.get('elapsed_sec','N/A'))
-            fmt_table = ''
 
         cards += '''
     <div class="card {cls}">
@@ -893,17 +1044,12 @@ def _build_html(results, summary, platform_filter):
     </div>
     '''.format(
             cls='card-ok' if is_ok else ('card-login' if (is_login and not cookies_used) else 'card-err'),
-            icon=icon, name=platform.upper(),
-            badge=status_badge, cookie_badge=cookie_badge,
-            thumb=thumb_html, meta=meta_rows,
-            fmt_table=fmt_table, url=r['url'],
-        )
+            icon=icon, name=platform.upper(), badge=status_badge, cookie_badge=cookie_badge,
+            thumb=thumb_html, meta=meta_rows, fmt_table=fmt_table, url=r['url'])
 
     platform_buttons = ''.join(
         '<a href="/api/test?platform={p}&format=html" class="btn-plat">{i} {p}</a>'.format(
-            p=p, i=PLATFORM_ICONS.get(p,''))
-        for p in sorted(TEST_URLS)
-    )
+            p=p, i=PLATFORM_ICONS.get(p,'')) for p in sorted(TEST_URLS))
 
     html = '''<!DOCTYPE html>
 <html lang="en">
@@ -932,29 +1078,21 @@ def _build_html(results, summary, platform_filter):
   .filter-bar{{margin-bottom:24px}}
   .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:20px}}
   .card{{background:#1e293b;border-radius:14px;overflow:hidden;border:1px solid #334155}}
-  .card-ok{{border-color:#166534}}
-  .card-err{{border-color:#7f1d1d}}
-  .card-login{{border-color:#78350f}}
+  .card-ok{{border-color:#166534}} .card-err{{border-color:#7f1d1d}} .card-login{{border-color:#78350f}}
   .card-header{{display:flex;align-items:center;gap:8px;padding:14px 16px;background:#0f172a;border-bottom:1px solid #334155;flex-wrap:wrap}}
-  .platform-icon{{font-size:1.4rem}}
-  .platform-name{{font-weight:700;font-size:1rem;letter-spacing:.05em;flex:1}}
+  .platform-icon{{font-size:1.4rem}} .platform-name{{font-weight:700;font-size:1rem;letter-spacing:.05em;flex:1}}
   .badge{{font-size:.72rem;padding:3px 9px;border-radius:20px;font-weight:600}}
-  .badge.ok{{background:#14532d;color:#86efac}}
-  .badge.err{{background:#7f1d1d;color:#fca5a5}}
-  .badge.login{{background:#78350f;color:#fcd34d}}
-  .badge.cookie{{background:#1e3a5f;color:#93c5fd}}
+  .badge.ok{{background:#14532d;color:#86efac}} .badge.err{{background:#7f1d1d;color:#fca5a5}}
+  .badge.login{{background:#78350f;color:#fcd34d}} .badge.cookie{{background:#1e3a5f;color:#93c5fd}}
   .thumb{{width:100%;height:180px;object-fit:cover;display:block}}
   .meta-table{{width:100%;border-collapse:collapse;font-size:.83rem}}
   .meta-table td{{padding:7px 14px;border-bottom:1px solid #0f172a}}
   .meta-table td:first-child{{color:#64748b;width:90px;white-space:nowrap}}
-  .val{{color:#e2e8f0;word-break:break-all}}
-  .url-cell a{{color:#60a5fa;text-decoration:none}}
-  .url-cell a:hover{{text-decoration:underline}}
+  .val{{color:#e2e8f0;word-break:break-all}} .url-cell a{{color:#60a5fa;text-decoration:none}}
   .err-msg{{color:#fca5a5;font-size:.78rem}}
   .source-url{{padding:8px 14px;font-size:.72rem;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
   .source-url a{{color:#475569;text-decoration:none}}
   details summary{{padding:8px 14px;font-size:.8rem;color:#60a5fa;cursor:pointer;list-style:none}}
-  details summary::-webkit-details-marker{{display:none}}
   .fmt-table{{width:100%;border-collapse:collapse;font-size:.75rem}}
   .fmt-table th{{background:#0f172a;color:#64748b;padding:5px 10px;text-align:left;font-weight:600}}
   .fmt-table td{{padding:4px 10px;border-top:1px solid #0f172a;color:#cbd5e1}}
@@ -983,16 +1121,11 @@ def _build_html(results, summary, platform_filter):
 </div>
 <div class="grid">{cards}</div>
 </body></html>'''.format(
-        score_color=score_color,
-        ytdlp_ver=yt_dlp_version,
-        api_ver=__version__,
+        score_color=score_color, ytdlp_ver=yt_dlp_version, api_ver=__version__,
         total=total, passed=passed,
         failed_real=summary['failed_real_errors'],
         failed_login=summary['failed_login_required'],
-        cookie_pills=cookie_pills,
-        platform_buttons=platform_buttons,
-        cards=cards,
-    )
+        cookie_pills=cookie_pills, platform_buttons=platform_buttons, cards=cards)
     return html
 
 
@@ -1001,11 +1134,8 @@ def _build_html(results, summary, platform_filter):
 def test_all_platforms():
     platform_filter = request.args.get('platform', None)
     response_format = request.args.get('format', 'json')
-    urls_to_test = {
-        k: v for k, v in TEST_URLS.items()
-        if platform_filter is None or k == platform_filter
-    }
-    results = {p: _run_test(p, u) for p, u in urls_to_test.items()}
+    urls_to_test    = {k: v for k, v in TEST_URLS.items() if platform_filter is None or k == platform_filter}
+    results         = {p: _run_test(p, u) for p, u in urls_to_test.items()}
     total           = len(results)
     passed          = sum(1 for r in results.values() if r['status'] == 'ok')
     failed_no_login = [p for p, r in results.items() if r['status'] == 'error' and p not in LOGIN_REQUIRED]
@@ -1018,8 +1148,7 @@ def test_all_platforms():
         'failed_login_platforms': login_blocked,
     }
     if response_format == 'html':
-        html = _build_html(results, summary, platform_filter)
-        resp = make_response(html)
+        resp = make_response(_build_html(results, summary, platform_filter))
         resp.headers['Content-Type'] = 'text/html; charset=utf-8'
         return resp
     return jsonify({'summary': summary, 'results': results})
