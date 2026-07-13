@@ -18,33 +18,39 @@ if not hasattr(sys.stderr, 'isatty'):
 
 
 # --- Cookie resolution: env var > repo file > none ---
-# On Heroku set config var: YOUTUBE_COOKIES with the full Netscape cookie file contents
 _COOKIES_ENV = os.environ.get('YOUTUBE_COOKIES', '')
 _COOKIES_REPO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
 
+# One-time temp file written at startup from env var
+_COOKIES_TEMP_PATH = None
 
 def _get_cookies_file():
-    """Return a valid path to a cookies.txt, or None.
-    If YOUTUBE_COOKIES env var is set, write it to a temp file and use that.
-    Otherwise fall back to the repo cookies.txt file.
-    """
+    global _COOKIES_TEMP_PATH
     if _COOKIES_ENV:
-        tmp = tempfile.NamedTemporaryFile(
-            mode='w', suffix='.txt', prefix='yt_cookies_', delete=False
-        )
-        tmp.write(_COOKIES_ENV)
-        tmp.flush()
-        tmp.close()
-        return tmp.name
+        if _COOKIES_TEMP_PATH is None or not os.path.isfile(_COOKIES_TEMP_PATH):
+            tmp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.txt', prefix='yt_cookies_', delete=False
+            )
+            tmp.write(_COOKIES_ENV)
+            tmp.flush()
+            tmp.close()
+            _COOKIES_TEMP_PATH = tmp.name
+        return _COOKIES_TEMP_PATH
     if os.path.isfile(_COOKIES_REPO_FILE):
         return _COOKIES_REPO_FILE
     return None
 
 
-# Smart format fallback chain:
-# 'best' is deprecated in yt-dlp. Use bestvideo+bestaudio merged, or best single file,
-# or fall back to whatever is available.
-DEFAULT_FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best/bestvideo/bestaudio'
+# yt-dlp modern format selector with full fallback chain
+DEFAULT_FORMAT = (
+    'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]'
+    '/bestvideo[ext=mp4]+bestaudio[ext=m4a]'
+    '/bestvideo+bestaudio'
+    '/mp4'
+    '/best'
+    '/bestvideo'
+    '/bestaudio'
+)
 
 
 class SimpleYDL(yt_dlp.YoutubeDL):
@@ -61,6 +67,19 @@ def get_videos(url, extra_params):
         'format': DEFAULT_FORMAT,
         'cachedir': False,
         'logger': current_app.logger.getChild('youtube-dl'),
+        # Prevent crash when no formats found
+        'ignore_no_formats_error': True,
+        # Retry on extraction errors (helps with transient bot checks)
+        'extractor_retries': 3,
+        # Skip unavailable fragments
+        'skip_unavailable_fragments': True,
+        # Use innertube web client which is less likely to be flagged
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'android', 'ios'],
+                'skip': ['translated_subs'],
+            }
+        },
     }
     cookies_path = _get_cookies_file()
     if cookies_path:
