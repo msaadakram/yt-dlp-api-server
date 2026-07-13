@@ -21,7 +21,6 @@ if not hasattr(sys.stderr, 'isatty'):
 _COOKIES_ENV = os.environ.get('YOUTUBE_COOKIES', '')
 _COOKIES_REPO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
 
-# One-time temp file written at startup from env var
 _COOKIES_TEMP_PATH = None
 
 def _get_cookies_file():
@@ -41,7 +40,6 @@ def _get_cookies_file():
     return None
 
 
-# yt-dlp modern format selector with full fallback chain
 DEFAULT_FORMAT = (
     'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]'
     '/bestvideo[ext=mp4]+bestaudio[ext=m4a]'
@@ -52,6 +50,20 @@ DEFAULT_FORMAT = (
     '/bestaudio'
 )
 
+# Real public test URLs for all major platforms
+TEST_URLS = {
+    'youtube':    'https://www.youtube.com/watch?v=BaW_jenozKc',
+    'instagram':  'https://www.instagram.com/reel/C9W0JHjIGdL/',
+    'twitter':    'https://twitter.com/i/status/1804553550801391673',
+    'tiktok':     'https://www.tiktok.com/@tiktok/video/6584647400055085317',
+    'facebook':   'https://www.facebook.com/watch/?v=1015749035228013',
+    'vimeo':      'https://vimeo.com/76979871',
+    'dailymotion':'https://www.dailymotion.com/video/x7tgd49',
+    'reddit':     'https://www.reddit.com/r/videos/comments/1b2m3n4/test/',
+    'twitch':     'https://www.twitch.tv/videos/2187069752',
+    'soundcloud': 'https://soundcloud.com/octobersveryown/laugh-now-cry-later',
+}
+
 
 class SimpleYDL(yt_dlp.YoutubeDL):
     def __init__(self, *args, **kargs):
@@ -60,20 +72,13 @@ class SimpleYDL(yt_dlp.YoutubeDL):
 
 
 def get_videos(url, extra_params):
-    '''
-    Get a list with a dict for every video founded
-    '''
     ydl_params = {
         'format': DEFAULT_FORMAT,
         'cachedir': False,
         'logger': current_app.logger.getChild('youtube-dl'),
-        # Prevent crash when no formats found
         'ignore_no_formats_error': True,
-        # Retry on extraction errors (helps with transient bot checks)
         'extractor_retries': 3,
-        # Skip unavailable fragments
         'skip_unavailable_fragments': True,
-        # Use innertube web client which is less likely to be flagged
         'extractor_args': {
             'youtube': {
                 'player_client': ['web', 'android', 'ios'],
@@ -235,6 +240,75 @@ def version():
         'yt-dlp-api-server': __version__,
     }
     return jsonify(result)
+
+
+@route_api('test')
+@set_access_control
+def test_all_platforms():
+    """
+    Test all supported platforms using real public URLs.
+    Returns status, title, and format count for each platform.
+    Visit: /api/test
+    Test one platform: /api/test?platform=youtube
+    """
+    platform_filter = request.args.get('platform', None)
+    urls_to_test = {
+        k: v for k, v in TEST_URLS.items()
+        if platform_filter is None or k == platform_filter
+    }
+
+    results = {}
+    for platform, url in urls_to_test.items():
+        try:
+            ydl_params = {
+                'format': DEFAULT_FORMAT,
+                'cachedir': False,
+                'quiet': True,
+                'no_warnings': True,
+                'ignore_no_formats_error': True,
+                'extractor_retries': 2,
+                'skip_unavailable_fragments': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['web', 'android', 'ios'],
+                        'skip': ['translated_subs'],
+                    }
+                },
+            }
+            cookies_path = _get_cookies_file()
+            if cookies_path:
+                ydl_params['cookiefile'] = cookies_path
+
+            with yt_dlp.YoutubeDL(ydl_params) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            formats = info.get('formats', [])
+            results[platform] = {
+                'status': 'ok',
+                'url': url,
+                'title': info.get('title', 'N/A'),
+                'duration': info.get('duration', 'N/A'),
+                'formats_available': len(formats),
+                'thumbnail': info.get('thumbnail', None),
+            }
+        except Exception as e:
+            results[platform] = {
+                'status': 'error',
+                'url': url,
+                'error': str(e),
+            }
+
+    total = len(results)
+    passed = sum(1 for r in results.values() if r['status'] == 'ok')
+    return jsonify({
+        'summary': {
+            'total': total,
+            'passed': passed,
+            'failed': total - passed,
+        },
+        'results': results,
+    })
+
 
 app = Flask(__name__)
 app.register_blueprint(api)
