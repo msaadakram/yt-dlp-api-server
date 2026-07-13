@@ -489,7 +489,7 @@ def _build_html(results, summary, platform_filter):
         )
 
     platform_buttons = ''.join(
-        '<a href="/api/test?platform={p}" class="btn-plat">{i} {p}</a>'.format(
+        '<a href="/api/test?platform={p}&format=html" class="btn-plat">{i} {p}</a>'.format(
             p=p, i=PLATFORM_ICONS.get(p,''))
         for p in sorted(TEST_URLS)
     )
@@ -517,6 +517,7 @@ def _build_html(results, summary, platform_filter):
   .btn-plat{{display:inline-block;padding:6px 14px;margin:4px;border-radius:8px;background:#1e293b;color:#94a3b8;text-decoration:none;font-size:.82rem;border:1px solid #334155}}
   .btn-plat:hover{{background:#334155;color:#f1f5f9}}
   .btn-all{{background:#3b82f6;color:#fff;border-color:#3b82f6}}
+  .btn-json{{background:#7c3aed;color:#fff;border-color:#7c3aed}}
   .filter-bar{{margin-bottom:24px}}
   .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:20px}}
   .card{{background:#1e293b;border-radius:14px;overflow:hidden;border:1px solid #334155}}
@@ -568,9 +569,9 @@ def _build_html(results, summary, platform_filter):
 </div>
 
 <div class="filter-bar">
-  <a href="/api/test" class="btn-plat btn-all">&#9654; All Platforms</a>
+  <a href="/api/test?format=html" class="btn-plat btn-all">&#9654; All Platforms</a>
   {platform_buttons}
-  <a href="/api/test?format=json" class="btn-plat" style="margin-left:8px">{{ }} JSON</a>
+  <a href="/api/test" class="btn-plat btn-json" style="margin-left:8px">&#123;&#125; JSON</a>
 </div>
 
 <div class="grid">{cards}</div>
@@ -591,8 +592,14 @@ def _build_html(results, summary, platform_filter):
 @route_api('test')
 @set_access_control
 def test_all_platforms():
+    """
+    /api/test                      -> JSON (default)
+    /api/test?format=html          -> HTML dashboard
+    /api/test?platform=youtube     -> single platform JSON
+    /api/test?platform=youtube&format=html -> single platform HTML
+    """
     platform_filter = request.args.get('platform', None)
-    response_format = request.args.get('format', 'html')
+    response_format = request.args.get('format', 'json')  # JSON is now the default
 
     urls_to_test = {
         k: v for k, v in TEST_URLS.items()
@@ -614,13 +621,14 @@ def test_all_platforms():
         'failed_login_platforms': login_blocked,
     }
 
-    if response_format == 'json':
-        return jsonify({'summary': summary, 'results': results})
+    if response_format == 'html':
+        html = _build_html(results, summary, platform_filter)
+        resp = make_response(html)
+        resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+        return resp
 
-    html = _build_html(results, summary, platform_filter)
-    resp = make_response(html)
-    resp.headers['Content-Type'] = 'text/html; charset=utf-8'
-    return resp
+    # Default: JSON
+    return jsonify({'summary': summary, 'results': results})
 
 
 app = Flask(__name__)
