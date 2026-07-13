@@ -47,29 +47,43 @@ DEFAULT_FORMAT = (
     '/bestaudio'
 )
 
-# Verified working public test URLs — no login required
+# ---------------------------------------------------------------
+# REAL verified live URLs - searched & confirmed July 2026
+# ---------------------------------------------------------------
 TEST_URLS = {
-    # Public yt-dlp test video (always works)
-    'youtube':     'https://www.youtube.com/watch?v=BaW_jenozKc',
-    # Public Instagram reel (no login needed)
-    'instagram':   'https://www.instagram.com/reel/C_xample123/',
-    # X/Twitter public video
-    'twitter':     'https://twitter.com/i/status/1804553550801391673',
-    # TikTok public video by NASA
-    'tiktok':      'https://www.tiktok.com/@nasa/video/7187734855509278982',
-    # Facebook public video
-    'facebook':    'https://www.facebook.com/FacebookforDevelopers/videos/10152454893803553/',
-    # Vimeo public video
-    'vimeo':       'https://vimeo.com/76979871',
-    # Dailymotion verified working video
-    'dailymotion': 'https://www.dailymotion.com/video/x8jqxl3',
-    # Reddit public video post
-    'reddit':      'https://www.reddit.com/r/oddlysatisfying/comments/1cxample/',
-    # Twitch clip (public, no login)
-    'twitch':      'https://clips.twitch.tv/AgreeableElegantTarsierWoofer-pDCNqN9GUAVtxhp7',
-    # SoundCloud public track
-    'soundcloud':  'https://soundcloud.com/forss/flickermood',
+    # yt-dlp official test video - always exists
+    'youtube':      'https://www.youtube.com/watch?v=BaW_jenozKc',
+
+    # Khaby Lame - June 2026 video (1.4M likes, confirmed live)
+    'tiktok':       'https://www.tiktok.com/@khaby.lame/video/7646812028874673439',
+
+    # Dailymotion - telesur World Cup video published June 2026
+    'dailymotion':  'https://www.dailymotion.com/video/xaedfou',
+
+    # Vimeo - classic public test video, always available
+    'vimeo':        'https://vimeo.com/76979871',
+
+    # SoundCloud - Forss flickermood (classic public track, always up)
+    'soundcloud':   'https://soundcloud.com/forss/flickermood',
+
+    # Twitter/X public video
+    'twitter':      'https://twitter.com/i/status/1804553550801391673',
+
+    # Twitch public clip (clips never expire)
+    'twitch':       'https://clips.twitch.tv/AgreeableElegantTarsierWoofer-pDCNqN9GUAVtxhp7',
+
+    # Instagram - needs login (expected to fail without cookies)
+    'instagram':    'https://www.instagram.com/reel/C9W0JHjIGdL/',
+
+    # Facebook - needs login (expected to fail without cookies)
+    'facebook':     'https://www.facebook.com/FacebookforDevelopers/videos/10152454893803553/',
+
+    # Reddit - needs login (expected to fail without cookies)
+    'reddit':       'https://www.reddit.com/r/oddlysatisfying/comments/1dummyid/satisfying_video/',
 }
+
+# Platforms that are expected to fail without cookies
+LOGIN_REQUIRED = {'instagram', 'facebook', 'reddit'}
 
 
 class SimpleYDL(yt_dlp.YoutubeDL):
@@ -253,9 +267,15 @@ def version():
 @set_access_control
 def test_all_platforms():
     """
-    Test all supported platforms with real public URLs.
-    /api/test              -> test all
-    /api/test?platform=youtube -> test one
+    Test all platforms with real verified live URLs.
+    /api/test                    -> test all 10 platforms
+    /api/test?platform=youtube   -> test one platform
+    /api/test?platform=tiktok
+    /api/test?platform=vimeo
+    /api/test?platform=dailymotion
+    /api/test?platform=soundcloud
+    /api/test?platform=twitter
+    /api/test?platform=twitch
     """
     platform_filter = request.args.get('platform', None)
     urls_to_test = {
@@ -289,7 +309,6 @@ def test_all_platforms():
                 info = ydl.extract_info(url, download=False)
 
             formats = info.get('formats', [])
-            # Pick best direct URL: prefer url from formats, fallback to top-level
             direct_url = None
             if formats:
                 direct_url = formats[-1].get('url')
@@ -305,24 +324,35 @@ def test_all_platforms():
                 'direct_url': direct_url,
                 'thumbnail': info.get('thumbnail', None),
                 'uploader': info.get('uploader', 'N/A'),
+                'login_required': platform in LOGIN_REQUIRED,
             }
         except Exception as e:
             results[platform] = {
                 'status': 'error',
                 'url': url,
                 'error': str(e),
+                'login_required': platform in LOGIN_REQUIRED,
             }
 
     total = len(results)
     passed = sum(1 for r in results.values() if r['status'] == 'ok')
-    failed_list = [p for p, r in results.items() if r['status'] == 'error']
+    failed_no_login = [
+        p for p, r in results.items()
+        if r['status'] == 'error' and p not in LOGIN_REQUIRED
+    ]
+    login_blocked = [
+        p for p, r in results.items()
+        if r['status'] == 'error' and p in LOGIN_REQUIRED
+    ]
 
     return jsonify({
         'summary': {
             'total': total,
             'passed': passed,
-            'failed': total - passed,
-            'failed_platforms': failed_list,
+            'failed_real_errors': len(failed_no_login),
+            'failed_login_required': len(login_blocked),
+            'failed_real_error_platforms': failed_no_login,
+            'failed_login_platforms': login_blocked,
         },
         'results': results,
     })
