@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 import traceback
 import sys
 
@@ -13,6 +14,9 @@ from .version import __version__
 if not hasattr(sys.stderr, 'isatty'):
     # In GAE it's not defined and we must monkeypatch
     sys.stderr.isatty = lambda: False
+
+
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cookies.txt')
 
 
 class SimpleYDL(yt_dlp.YoutubeDL):
@@ -30,6 +34,10 @@ def get_videos(url, extra_params):
         'cachedir': False,
         'logger': current_app.logger.getChild('youtube-dl'),
     }
+    # Inject cookies file if it exists to bypass YouTube bot detection
+    if os.path.isfile(COOKIES_FILE):
+        ydl_params['cookiefile'] = COOKIES_FILE
+
     ydl_params.update(extra_params)
     ydl = SimpleYDL(ydl_params)
     res = ydl.extract_info(url, download=False)
